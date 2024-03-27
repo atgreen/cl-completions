@@ -23,6 +23,6 @@
 ;;; SOFTWARE.
 ;;;
 
-(defpackage #:embeddings
+(defpackage #:completions
   (:use #:cl)
-  (:export embeddings openai-embeddings get-embedding))
+  (:export completions openai-completions get-completion))
