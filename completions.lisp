@@ -114,11 +114,14 @@
 
 (defmethod get-completion ((provider openai-completions) starter-text max-tokens)
   (with-slots (endpoint api-key model completion-token-count prompt-token-count tools) provider
-    (let* ((payload `((:messages . (((:role . "user") (:content . ,starter-text))))
+    (let* ((tools-rendered (loop for tool-symbol in tools
+                                 collect (let ((tool (gethash (symbol-name tool-symbol) *tools*)))
+                                           (if tool
+                                               (render tool)
+                                               (error "Undefined tool function: " tool-symbol)))))
+           (payload `((:messages . (((:role . "user") (:content . ,starter-text))))
                       (:model . ,model)
-                      (:tools . ,(loop for key being the hash-keys of tools
-                                         using (hash-value value)
-                                       collect (render value)))
+                      (:tools . ,tools-rendered)
                       (:max_tokens . ,max-tokens)))
            (headers `(("Content-Type" . "application/json")
                       ("Authorization" . ,(concatenate 'string "Bearer " api-key)))))
