@@ -45,6 +45,13 @@ This code generates output like:
 The current time in Toronto is 20:01:22 and it's cold there right now
 ```
 
+Related Projects
+-----------------
+
+See also [cl-embeddings](https://github.com/atgreen/cl-embeddings) for
+a similarly styled LLM embeddings library, and
+[cl-chroma](https://github.com/atgreen/cl-chroma) for a Lisp interface
+to the [Chroma](https://www.trychroma.com/) vector database.
 
 Author and License
 -------------------
