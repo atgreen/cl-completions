@@ -69,9 +69,8 @@
   (unless (stringp description)
     (error "DESCRIPTION must be a string."))
   (dolist (arg args)
-    (let ((type (second arg)))
-      (unless (member (second arg) '(string number boolean) :test #'equal)
-        (error "Unsupported defun-tool argument type: ~a" (second arg)))))
+    (unless (member (second arg) '(string number boolean) :test #'equal)
+      (error "Unsupported defun-tool argument type: ~a" (second arg))))
   ;; Generate code
   (let ((name-str (if (symbolp name) (symbol-name name) name))
         (arg-names (mapcar #'first args)))
@@ -118,7 +117,7 @@
                                  collect (let ((tool (gethash (symbol-name tool-symbol) *tools*)))
                                            (if tool
                                                (render tool)
-                                               (error "Undefined tool function: " tool-symbol)))))
+                                               (error "Undefined tool function: ~A" tool-symbol)))))
            (payload `((:messages . (((:role . "user") (:content . ,starter-text))))
                       (:model . ,model)
                       (:tools . ,tools-rendered)
