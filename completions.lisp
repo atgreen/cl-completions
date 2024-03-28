@@ -25,10 +25,12 @@
 
 (in-package :completions)
 
-(defclass completions ()
+(defvar *tools* (make-hash-table :test 'equalp))
+
+(defclass completer ()
   ())
 
-(defclass openai-completions (completions)
+(defclass openai-completer (completer)
   ((endpoint :initform "https://api.openai.com/v1/chat/completions")
    (api-key :initarg :api-key)
    (prompt-token-count :initform 0)
@@ -59,8 +61,6 @@
                                                                              (cons :description (third p))))))
                                         (:required . ,(loop for p in parameters
                                                             collect (first p)))))))))))
-
-(setf *tools* (make-hash-table :test 'equalp))
 
 (defmacro defun-tool (name args description &rest body)
   ;; Compile time checks

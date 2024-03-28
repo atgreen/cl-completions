@@ -12,8 +12,8 @@ $ ocicl install completions
 OpenAI is the only supported provider today.  Use it like so:
 
 ```
-(let ((completion (make-instance 'openai-completions :api-key OPENAI-API-KEY)))
-  (get-completion completion "It's a beautiful day for " 100))
+(let ((completer (make-instance 'openai-completer :api-key OPENAI-API-KEY)))
+  (get-completion completer "It's a beautiful day for " 100))
 ```
 
 You can also define callback functions, like so:
@@ -34,7 +34,7 @@ You can also define callback functions, like so:
      "cold")
     (t "warm")))
 
-(let ((c (make-instance 'openai-completions
+(let ((c (make-instance 'openai-completer
                         :api-key OPENAI-API-KEY
                         :tools '(time-of-day get-temperature))))
   (get-completion c "I'm in Toronto. What's the time and temperature here?" 20))

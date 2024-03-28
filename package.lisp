@@ -25,4 +25,4 @@
 
 (defpackage #:completions
   (:use #:cl)
-  (:export completions openai-completions get-completion))
+  (:export completer openai-completer get-completion defun-tool))
