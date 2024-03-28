@@ -36,7 +36,7 @@ You can also define callback functions, like so:
 
 (let ((c (make-instance 'openai-completions
                         :api-key OPENAI-API-KEY
-                        :tools *tools*)))
+                        :tools '(time-of-day get-temperature))))
   (get-completion c "I'm in Toronto. What's the time and temperature here?" 20))
 ```
 
