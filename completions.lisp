@@ -112,7 +112,7 @@
               (completions-loop provider endpoint headers payload))
             (cdr (assoc :CONTENT first-choice)))))))
 
-(defmethod get-completion ((provider openai-completions) starter-text max-tokens)
+(defmethod get-completion ((provider openai-completer) starter-text max-tokens)
   (with-slots (endpoint api-key model completion-token-count prompt-token-count tools) provider
     (let* ((tools-rendered (loop for tool-symbol in tools
                                  collect (let ((tool (gethash (symbol-name tool-symbol) *tools*)))
