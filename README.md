@@ -9,14 +9,23 @@ Usage
 $ ocicl install completions
 ```
 
-OpenAI is the only supported provider today.  Use it like so:
+`cl-completions` supports both [ollama](https://ollama.com/) and [OpenAI](https://openai.com/blog/openai-api) APIs.
+
+To use the ollama API:
 
 ```
-(let ((completer (make-instance 'openai-completer :api-key OPENAI-API-KEY)))
+(let ((completer (make-instance 'ollama-completer :model "mistral:latest" 100)))
+  (get-completion completer "It's a beautiful day for "))
+```
+
+To use the OpenAI API:
+
+```
+(let ((completer (make-instance 'openai-completer :api-key (uiop:getenv "OPENAI_API_KEY"))))
   (get-completion completer "It's a beautiful day for " 100))
 ```
 
-You can also define callback functions, like so:
+In addition, the OpenAI completer supports callback functions, like so:
 
 ```
 (defun-tool time-of-day ()
@@ -35,7 +44,7 @@ You can also define callback functions, like so:
     (t "warm")))
 
 (let ((c (make-instance 'openai-completer
-                        :api-key OPENAI-API-KEY
+                        :api-key (uiop:getenv "OPENAI_API_KEY")
                         :tools '(time-of-day get-temperature))))
   (get-completion c "I'm in Toronto. What's the time and temperature here?" 20))
 ```

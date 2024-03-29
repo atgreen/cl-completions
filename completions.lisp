@@ -38,6 +38,10 @@
    (model :initarg :model :initform "gpt-4")
    (tools :initarg :tools :initform (list))))
 
+(defclass ollama-completer (completer)
+  ((endpoint :initform "http://localhost:11434/api/chat")
+   (model :initarg :model)))
+
 (defclass tool ()
   ())
 
@@ -125,3 +129,23 @@
            (headers `(("Content-Type" . "application/json")
                       ("Authorization" . ,(concatenate 'string "Bearer " api-key)))))
       (completions-loop provider endpoint headers payload))))
+
+(defmethod get-completion ((provider ollama-completer) starter-text max-tokens)
+  ;; Fixme: max-tokens is ignored
+  (with-slots (endpoint model) provider
+    (let ((payload (make-hash-table))
+          (msgs (make-hash-table)))
+      (setf (gethash "role" msgs) "user")
+      (setf (gethash "content" msgs) starter-text)
+      (setf (gethash "messages" payload) (make-array 1 :initial-contents (list msgs)))
+      (setf (gethash "model" payload) model)
+      (setf (gethash "stream" payload) nil)
+      (let* ((headers `(("Content-Type" . "application/json")))
+             (response (json:decode-json-from-string
+                        (flexi-streams:octets-to-string
+                         (drakma:http-request endpoint
+                                              :method :post
+                                              :content (com.inuoe.jzon:stringify payload)
+                                              :additional-headers headers
+                                              :content-type "application/json")))))
+        (cdr (assoc :content (cdr (assoc :message response))))))))
