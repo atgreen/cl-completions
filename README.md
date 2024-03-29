@@ -14,8 +14,8 @@ $ ocicl install completions
 To use the ollama API:
 
 ```
-(let ((completer (make-instance 'ollama-completer :model "mistral:latest" 100)))
-  (get-completion completer "It's a beautiful day for "))
+(let ((completer (make-instance 'ollama-completer :model "mistral:latest")))
+  (get-completion completer "It's a beautiful day for " 100))
 ```
 
 To use the OpenAI API:
