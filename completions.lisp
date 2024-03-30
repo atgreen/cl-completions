@@ -113,39 +113,45 @@
                                                                       (loop for arg in args
                                                                             collect (cdr arg))))))))))
               (completions-loop provider endpoint headers payload))
-            (cdr (assoc :CONTENT first-choice)))))))
+            first-choice)))))
 
-(defmethod get-completion ((provider openai-completer) starter-text max-tokens)
+(defmethod get-completion ((provider openai-completer) messages max-tokens)
+  (when (stringp messages)
+    (setf messages `(((:role . "user") (:content . ,messages)))))
+
   (with-slots (endpoint api-key model completion-token-count prompt-token-count tools) provider
     (let* ((tools-rendered (loop for tool-symbol in tools
                                  collect (let ((tool (gethash (symbol-name tool-symbol) *tools*)))
                                            (if tool
                                                (render tool)
                                                (error "Undefined tool function: ~A" tool-symbol)))))
-           (payload `((:messages . (((:role . "user") (:content . ,starter-text))))
+           (payload `((:messages . ,messages)
                       (:model . ,model)
                       (:tools . ,tools-rendered)
                       (:max_tokens . ,max-tokens)))
            (headers `(("Content-Type" . "application/json")
                       ("Authorization" . ,(concatenate 'string "Bearer " api-key)))))
-      (completions-loop provider endpoint headers payload))))
+      (let ((response (completions-loop provider endpoint headers payload)))
+        (values (cdr (assoc :content response))
+                (append messages (list response)))))))
 
-(defmethod get-completion ((provider ollama-completer) starter-text max-tokens)
+
+(defmethod get-completion ((provider ollama-completer) messages max-tokens)
   ;; Fixme: max-tokens is ignored
+  (when (stringp messages)
+    (setf messages `(((:role . "user") (:content . ,messages)))))
+
   (with-slots (endpoint model) provider
-    (let ((payload (make-hash-table))
-          (msgs (make-hash-table)))
-      (setf (gethash "role" msgs) "user")
-      (setf (gethash "content" msgs) starter-text)
-      (setf (gethash "messages" payload) (make-array 1 :initial-contents (list msgs)))
-      (setf (gethash "model" payload) model)
-      (setf (gethash "stream" payload) nil)
+    (let ((content
+            (format nil "{ \"model\": ~S, \"stream\": false, \"messages\": ~A }"
+                    model (json:encode-json-to-string (make-array (length messages) :initial-contents messages)))))
       (let* ((headers `(("Content-Type" . "application/json")))
              (response (json:decode-json-from-string
                         (flexi-streams:octets-to-string
                          (drakma:http-request endpoint
                                               :method :post
-                                              :content (com.inuoe.jzon:stringify payload)
+                                              :content content
                                               :additional-headers headers
                                               :content-type "application/json")))))
-        (cdr (assoc :content (cdr (assoc :message response))))))))
+        (values (cdr (assoc :content (cdr (assoc :message response))))
+                (append messages (list (cdr (assoc :message response)))))))))
