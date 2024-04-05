@@ -31,4 +31,4 @@
   :serial t
   :components ((:file "package")
                (:file "completions"))
-  :depends-on (:drakma :cl-json :flexi-streams))
+  :depends-on (:drakma :cl-json :flexi-streams :str))
