@@ -25,4 +25,4 @@
 
 (defpackage #:completions
   (:use #:cl)
-  (:export completer openai-completer ollama-completer get-completion defun-tool))
+  (:export completer openai-completer ollama-completer anthropic-completer get-completion defun-tool))

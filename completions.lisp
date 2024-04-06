@@ -38,6 +38,12 @@
    (model :initarg :model :initform "gpt-4")
    (tools :initarg :tools :initform (list))))
 
+(defclass anthropic-completer (completer)
+  ((endpoint :initform "https://api.anthropic.com/v1/messages")
+   (api-key :initarg :api-key)
+   (model :initarg :model :initform "claude-3-opus-20240229")
+   (tools :initarg :tools :initform (list))))
+
 (defclass ollama-completer (completer)
   ((endpoint :initform "http://localhost:11434/api/chat")
    (model :initarg :model)))
@@ -246,3 +252,32 @@
                                                   :content-type "application/json")))))
             (values (cdr (assoc :content (cdr (assoc :message response))))
                 (append messages (list (cdr (assoc :message response))))))))))
+
+(defmethod get-completion ((provider anthropic-completer) messages &key (max-tokens 1024) (streaming-callback nil))
+  (when (stringp messages)
+    (setf messages `(((:role . "user") (:content . ,messages)))))
+
+  (when streaming-callback
+    (error "streaming-callback not currently supported with anthropic completer"))
+
+  (with-slots (endpoint api-key model) provider
+    (let ((content
+            (format nil "{
+\"model\": ~S,
+\"max_tokens\": ~A,
+\"messages\": ~A
+}"
+                    model
+                    max-tokens
+                    (json:encode-json-to-string (make-array (length messages) :initial-contents messages))))
+          (headers `(("x-api-key" . ,api-key)
+                     ("anthropic-version" . "2023-06-01"))))
+      (let* ((response (json:decode-json-from-string
+                        (flexi-streams:octets-to-string
+                         (drakma:http-request endpoint
+                                              :method :post
+                                              :content content
+                                              :additional-headers headers
+                                              :content-type "application/json")))))
+        (values (cdr (assoc :text (cadr (assoc :content response))))
+                (append messages `(((:role . "assistant") ,(assoc :content response)))))))))

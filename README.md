@@ -9,7 +9,7 @@ Usage
 $ ocicl install completions
 ```
 
-`cl-completions` supports both [ollama](https://ollama.com/) and [OpenAI](https://openai.com/blog/openai-api) APIs.
+`cl-completions` supports [ollama](https://ollama.com/), [OpenAI](https://openai.com/blog/openai-api), and [Anthropic](https://anthropic.com/api) APIs.
 
 To use the ollama API:
 
@@ -22,6 +22,13 @@ To use the OpenAI API:
 
 ```
 (let ((completer (make-instance 'openai-completer :api-key (uiop:getenv "OPENAI_API_KEY"))))
+  (get-completion completer "It's a beautiful day for " 100))
+```
+
+To use the Anthropic API:
+
+```
+(let ((completer (make-instance anthropic-completer :api-key (uiop:getenv "ANTHROPIC_API_KEY"))))
   (get-completion completer "It's a beautiful day for " 100))
 ```
 
