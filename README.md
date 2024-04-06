@@ -65,6 +65,7 @@ Related Projects
 -----------------
 
 Related projects include:
+* [cl-text-splitter](https://github.com/atgreen/cl-text-splitter): a text splitting library
 * [cl-embeddings](https://github.com/atgreen/cl-embeddings): an LLM embeddings library
 * [cl-chroma](https://github.com/atgreen/cl-chroma): for a Lisp interface to the [Chroma](https://www.trychroma.com/) vector database.
 * [cl-chat](https://github.com/atgreen/cl-chat): a wrapper around `completions` to maintain chat history,
