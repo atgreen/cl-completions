@@ -57,10 +57,10 @@ The current time in Toronto is 20:01:22 and it's cold there right now
 Related Projects
 -----------------
 
-See also [cl-embeddings](https://github.com/atgreen/cl-embeddings) for
-a similarly styled LLM embeddings library, and
-[cl-chroma](https://github.com/atgreen/cl-chroma) for a Lisp interface
-to the [Chroma](https://www.trychroma.com/) vector database.
+Related projects include:
+* [cl-embeddings](https://github.com/atgreen/cl-embeddings): an LLM embeddings library
+* [cl-chroma](https://github.com/atgreen/cl-chroma): for a Lisp interface to the [Chroma](https://www.trychroma.com/) vector database.
+* [cl-chat](https://github.com/atgreen/cl-chat): a wrapper around `completions` to maintain chat history,
 
 Author and License
 -------------------
