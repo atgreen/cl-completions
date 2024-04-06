@@ -28,7 +28,7 @@ To use the OpenAI API:
 To use the Anthropic API:
 
 ```
-(let ((completer (make-instance anthropic-completer :api-key (uiop:getenv "ANTHROPIC_API_KEY"))))
+(let ((completer (make-instance 'anthropic-completer :api-key (uiop:getenv "ANTHROPIC_API_KEY"))))
   (get-completion completer "It's a beautiful day for " 100))
 ```
 
