@@ -233,15 +233,18 @@
                                                       :additional-headers headers
                                                       :content-type "application/json"
                                                       :want-stream t)))
-            (unwind-protect
-                 (with-output-to-string (sstream)
-                   (loop
-                     for json-object = (ignore-errors (json:decode-json-from-string (read-line response-stream)))
-                     until (or (null json-object) (cdr (assoc :done json-object)))
-                     do (progn
-                          (format sstream "~A" (cdr (assoc :CONTENT (cdr (assoc :MESSAGE json-object)))))
-                          (funcall streaming-callback (cdr (assoc :CONTENT (cdr (assoc :MESSAGE json-object))))))))
-              (close response-stream)))
+            (let ((response
+                    (unwind-protect
+                         (with-output-to-string (sstream)
+                           (loop
+                             for json-object = (ignore-errors (json:decode-json-from-string (read-line response-stream)))
+                             until (or (null json-object) (cdr (assoc :done json-object)))
+                             do (progn
+                                  (format sstream "~A" (cdr (assoc :CONTENT (cdr (assoc :MESSAGE json-object)))))
+                                  (funcall streaming-callback (cdr (assoc :CONTENT (cdr (assoc :MESSAGE json-object))))))))
+                      (close response-stream)))
+                  (values response
+                          (append messages (list `((:ROLE . "assistant") (:CONTENT . ,response)))))))
 
           (let* ((response (json:decode-json-from-string
                             (flexi-streams:octets-to-string
