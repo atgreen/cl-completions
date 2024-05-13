@@ -242,7 +242,7 @@
                              do (progn
                                   (format sstream "~A" (cdr (assoc :CONTENT (cdr (assoc :MESSAGE json-object)))))
                                   (funcall streaming-callback (cdr (assoc :CONTENT (cdr (assoc :MESSAGE json-object))))))))
-                      (close response-stream)))
+                      (close response-stream))))
                   (values response
                           (append messages (list `((:ROLE . "assistant") (:CONTENT . ,response)))))))
 
