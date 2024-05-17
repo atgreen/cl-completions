@@ -25,6 +25,9 @@
 
 (in-package :completions)
 
+;; Set this to an output stream to see debug logs.
+(defvar *debug-stream* nil)
+
 (defvar *tools* (make-hash-table :test 'equalp))
 
 (defclass completer ()
@@ -96,6 +99,8 @@
 
 (defun read-streamed-json-objects (stream streaming-callback)
   (loop for line = (read-line stream nil 'eof)
+        when *debug-stream*
+          do (format *debug-stream* "~&completions line: ~A~%" line)
         until (or (eq line 'eof) (string= "data: [DONE]" line))
         when (and (> (length line) 6) (str:starts-with? "data: {" line))
         collect (let ((json (json:decode-json-from-string (subseq line 6))))
