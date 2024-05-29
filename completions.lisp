@@ -28,6 +28,9 @@
 ;; Set this to an output stream to see debug logs.
 (defvar *debug-stream* nil)
 
+;; 120 second read timeout by default
+(defvar *read-timeout* 120)
+
 (defvar *tools* (make-hash-table :test 'equalp))
 
 (defclass completer ()
@@ -132,12 +135,11 @@
   (let ((payload (format nil payload-format-string (json:encode-json-to-string messages)))
         (objs))
     (if streaming-callback
-        (let* ((response-stream (drakma:http-request endpoint
-                                                     :method :post
-                                                    :content payload
-                                                    :additional-headers headers
-                                                    :content-type "application/json"
-                                                    :want-stream t)))
+        (let* ((response-stream (dex:post endpoint
+                                          :read-timeout *read-timeout*
+                                          :content payload
+                                          :headers headers
+                                          :want-stream t)))
           (unwind-protect
                (setf objs (read-streamed-json-objects response-stream streaming-callback))
             (close response-stream))
@@ -168,13 +170,11 @@
 
       ;; Non-streaming...
       (let ((objs (json:decode-json-from-string
-                   (flexi-streams:octets-to-string
-                    (drakma:http-request endpoint
-                                        :method :post
-                                        :content payload
-                                        :additional-headers headers
-                                        :content-type "application/json"
-                                        :want-stream nil)))))
+                    (dex:post endpoint
+                              :read-timeout *read-timeout*
+                              :content payload
+                              :headers headers
+                              :want-stream nil))))
         (let ((tool-calls (cdr (assoc :tool--calls (cdr (assoc :message (car (cdr (assoc :choices objs)))))))))
           (if tool-calls
               (let ((tool-answers (loop for tool-call in tool-calls
@@ -232,12 +232,11 @@
 
       (if streaming-callback
 
-          (let ((response-stream (drakma:http-request endpoint
-                                                      :method :post
-                                                      :content content
-                                                      :additional-headers headers
-                                                      :content-type "application/json"
-                                                      :want-stream t)))
+          (let ((response-stream (dex:post endpoint
+                                           :read-timeout *read-timeout*
+                                           :content content
+                                           :headers headers
+                                           :want-stream t)))
             (let ((response
                     (unwind-protect
                          (with-output-to-string (sstream)
@@ -252,12 +251,10 @@
                           (append messages (list `((:ROLE . "assistant") (:CONTENT . ,response)))))))
 
           (let* ((response (json:decode-json-from-string
-                            (flexi-streams:octets-to-string
-                             (drakma:http-request endpoint
-                                                  :method :post
-                                                  :content content
-                                                  :additional-headers headers
-                                                  :content-type "application/json")))))
+                            (dex:post endpoint
+                                      :read-timeout *read-timeout*
+                                      :content content
+                                      :headers headers))))
             (values (cdr (assoc :content (cdr (assoc :message response))))
                 (append messages (list (cdr (assoc :message response))))))))))
 
@@ -281,11 +278,10 @@
           (headers `(("x-api-key" . ,api-key)
                      ("anthropic-version" . "2023-06-01"))))
       (let* ((response (json:decode-json-from-string
-                        (flexi-streams:octets-to-string
-                         (drakma:http-request endpoint
-                                              :method :post
-                                              :content content
-                                              :additional-headers headers
-                                              :content-type "application/json")))))
+                        (dex:post endpoint
+                                  :read-timeout *read-timeout*
+                                  :content content
+                                  :headers headers
+                                  :content-type "application/json"))))
         (values (cdr (assoc :text (cadr (assoc :content response))))
                 (append messages `(((:role . "assistant") ,(assoc :content response)))))))))
