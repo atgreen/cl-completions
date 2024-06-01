@@ -61,6 +61,11 @@ This code generates output like:
 The current time in Toronto is 20:01:22 and it's cold there right now
 ```
 
+The default read timeout for a response from the completer is 120
+seconds.  You can modify this by setting `completions:*read-timeout*`
+to a new value.
+
+
 Related Projects
 -----------------
 
