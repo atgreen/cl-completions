@@ -175,6 +175,8 @@
                               :content payload
                               :headers headers
                               :want-stream nil))))
+        (when *debug-stream*
+          (format *debug-stream* "~&api call result: ~A~%" objs))
         (let ((tool-calls (cdr (assoc :tool--calls (cdr (assoc :message (car (cdr (assoc :choices objs)))))))))
           (if tool-calls
               (let ((tool-answers (loop for tool-call in tool-calls
