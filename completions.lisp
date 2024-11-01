@@ -196,7 +196,7 @@
                                   payload-format-string nil))
             (cdr (assoc :content (cdr (assoc :message (cadr (assoc :choices objs))))))))))))
 
-(defmethod get-completion ((provider openai-completer) messages &key (max-tokens 1024) (streaming-callback nil))
+(defmethod get-completion ((provider openai-completer) messages &key (max-tokens 1024) (streaming-callback nil) (response-format nil))
   (when (stringp messages)
     (setf messages `(((:role . "user") (:content . ,messages)))))
   (with-slots (endpoint api-key model completion-token-count prompt-token-count tools) provider
@@ -207,10 +207,11 @@
                                                              (render tool)
                                                              (error "Undefined tool function: ~A" tool-symbol))))))
            (payload-format-string
-             (format nil "{ \"model\": ~S, \"stream\": ~A, ~A \"messages\": ~~A, \"max_tokens\": ~A }"
+             (format nil "{ \"model\": ~S, \"stream\": ~A, ~A ~A \"messages\": ~~A, \"max_tokens\": ~A }"
                      model
                      (if streaming-callback "true" "false")
                      (if tools (format nil "\"tools\": ~A," tools-rendered) "")
+                     (if response-format (format nil "\"response_format\": { \"type\": ~S }," response-format) "")
                      max-tokens))
            (headers `(("Content-Type" . "application/json")
                       ("Authorization" . ,(concatenate 'string "Bearer " api-key)))))
@@ -219,16 +220,17 @@
                 (append messages (list `((:ROLE . "assistant") (:CONTENT . ,response)))))))))
 
 
-(defmethod get-completion ((provider ollama-completer) messages &key (max-tokens 1024) (streaming-callback nil))
+(defmethod get-completion ((provider ollama-completer) messages &key (max-tokens 1024) (streaming-callback nil) (response-format nil))
   ;; Fixme: max-tokens is ignored
   (when (stringp messages)
     (setf messages `(((:role . "user") (:content . ,messages)))))
 
   (with-slots (endpoint model) provider
     (let ((content
-            (format nil "{ \"model\": ~S, \"stream\": ~A, \"messages\": ~A }"
+            (format nil "{ \"model\": ~S, \"stream\": ~A, ~A \"messages\": ~A }"
                     model
                     (if streaming-callback "true" "false")
+                    (if response-format (format nil "\"format\": ~S," response-format) "")
                     (json:encode-json-to-string (make-array (length messages) :initial-contents messages))))
           (headers `(("Content-Type" . "application/json"))))
 
