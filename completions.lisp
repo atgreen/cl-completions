@@ -37,7 +37,7 @@
   ())
 
 (defclass openai-completer (completer)
-  ((endpoint :initform "https://api.openai.com/v1/chat/completions")
+  ((endpoint :initform "https://api.openai.com/v1/chat/completions" :initarg :endpoint)
    (api-key :initarg :api-key)
    (prompt-token-count :initform 0)
    (completion-token-count :initform 0)
@@ -45,13 +45,13 @@
    (tools :initarg :tools :initform (list))))
 
 (defclass anthropic-completer (completer)
-  ((endpoint :initform "https://api.anthropic.com/v1/messages")
+  ((endpoint :initform "https://api.anthropic.com/v1/messages" :initarg :endpoint)
    (api-key :initarg :api-key)
    (model :initarg :model :initform "claude-3-opus-20240229")
    (tools :initarg :tools :initform (list))))
 
 (defclass ollama-completer (completer)
-  ((endpoint :initform "http://localhost:11434/api/chat")
+  ((endpoint :initform "http://localhost:11434/api/chat" :initarg :endpoint)
    (model :initarg :model)))
 
 (defclass tool ()
