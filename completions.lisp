@@ -135,7 +135,7 @@
   (let ((encodings '(:utf-8 :iso-8859-1 :windows-1252)))
     (loop for encoding in encodings
           do (handler-case
-                 (return (babel:octets-to-string byte-array encoding :errorp t))
+                 (return (babel:octets-to-string byte-array :encoding encoding :errorp t))
                (error () (when *debug-stream* (format *debug-stream* "~&*BARF* on string conversion~%")) nil)))))
 
 (defun completions-loop (provider endpoint headers messages payload-format-string streaming-callback)
