@@ -178,12 +178,14 @@
       ;; Non-streaming...
       (let ((objs (json:decode-json-from-string
                    (convert-byte-array-to-utf8
-                    (dex:post endpoint
-                              :read-timeout *read-timeout*
-                              :content payload
-                              :headers headers
-                              :force-binary t
-                              :want-stream nil)))))
+                    (let ((ba (dex:post endpoint
+                                        :read-timeout *read-timeout*
+                                        :content payload
+                                        :headers headers
+                                        :force-binary t
+                                        :want-stream nil)))
+                      (when *debug-stream* (print ba))
+                      ba)))))
         (when *debug-stream*
           (format *debug-stream* "~&api call result: ~A~%" objs))
         (let ((tool-calls (cdr (assoc :tool--calls (cdr (assoc :message (car (cdr (assoc :choices objs)))))))))
