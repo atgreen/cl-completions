@@ -131,6 +131,13 @@
     ;; Concatenate all collected argument strings in reverse order to maintain the original order.
     (apply #'concatenate 'string (reverse argument-strings))))
 
+(defun convert-byte-array-to-utf8 (byte-array)
+  (let ((encodings '(:utf-8 :iso-8859-1 :windows-1252)))
+    (loop for encoding in encodings
+          do (handler-case
+                 (return (babel:octets-to-string byte-array encoding))
+               (babel:encoding-error () (when *debug-stream* (format *debug-stream* "~&*BARF* on string conversion~%")) nil)))))
+
 (defun completions-loop (provider endpoint headers messages payload-format-string streaming-callback)
   (let ((payload (format nil payload-format-string (json:encode-json-to-string messages)))
         (objs))
@@ -170,11 +177,13 @@
 
       ;; Non-streaming...
       (let ((objs (json:decode-json-from-string
+                   (convert-byte-array-to-utf8
                     (dex:post endpoint
                               :read-timeout *read-timeout*
                               :content payload
                               :headers headers
-                              :want-stream nil))))
+                              :force-binary t
+                              :want-stream nil)))))
         (when *debug-stream*
           (format *debug-stream* "~&api call result: ~A~%" objs))
         (let ((tool-calls (cdr (assoc :tool--calls (cdr (assoc :message (car (cdr (assoc :choices objs)))))))))
