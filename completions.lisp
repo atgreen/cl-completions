@@ -2,7 +2,7 @@
 ;;;
 ;;; SPDX-License-Identifier: MIT
 ;;;
-;;; Copyright (C) 2024  Anthony Green <green@moxielogic.com>
+;;; Copyright (C) 2024, 2025  Anthony Green <green@moxielogic.com>
 ;;;
 ;;; Permission is hereby granted, free of charge, to any person obtaining a copy
 ;;; of this software and associated documentation files (the "Software"), to deal
@@ -33,6 +33,34 @@
 
 (defvar *tools* (make-hash-table :test 'equalp))
 
+;; Permission and safety system
+(defvar *permission-callback* nil
+  "Callback function for tool permission requests. Should accept (tool-name args description) and return boolean.")
+
+(defvar *default-safety-level* :safe
+  "Default safety level for tools: :safe, :requires-approval, or :dangerous")
+
+(defvar *safe-tools* (make-hash-table :test 'equalp)
+  "Hash table mapping tool names to their safety levels")
+
+;; Tool categories
+(defvar *tool-categories* (make-hash-table :test 'equalp)
+  "Hash table mapping tool names to their categories")
+
+;; Context binding support
+(defvar *tool-context-vars* nil
+  "List of dynamic variables to capture during tool execution")
+
+;; Event hooks
+(defvar *tool-start-hooks* nil
+  "List of functions to call when a tool starts executing")
+
+(defvar *tool-complete-hooks* nil
+  "List of functions to call when a tool completes successfully")
+
+(defvar *tool-error-hooks* nil
+  "List of functions to call when a tool encounters an error")
+
 (defclass completer ()
   ())
 
@@ -61,7 +89,17 @@
   ((description :initarg :description)
    (name :initarg :name)
    (parameters :initarg :parameters)
-   (fn :initarg :fn)))
+   (fn :initarg :fn)
+   (safety-level :initarg :safety-level :initform nil)
+   (category :initarg :category :initform nil)
+   (context-vars :initarg :context-vars :initform nil)
+   (requires-approval :initarg :requires-approval :initform nil)
+   (approval-description :initarg :approval-description :initform nil)
+   (permission-callback :initarg :permission-callback :initform nil)
+   (on-start :initarg :on-start :initform nil)
+   (on-complete :initarg :on-complete :initform nil)
+   (on-error :initarg :on-error :initform nil)
+   (parameter-validators :initarg :parameter-validators :initform nil)))
 
 (defmethod render ((tool function-tool))
   (with-slots (description name parameters) tool
@@ -78,34 +116,188 @@
                                         (:required . ,(loop for p in parameters
                                                             collect (first p)))))))))))
 
-(defmacro defun-tool (name args description &rest body)
-  ;; Compile time checks
-  (unless (listp args)
-    (error "ARGS must be a list."))
-  (unless (stringp description)
-    (error "DESCRIPTION must be a string."))
-  (dolist (arg args)
-    (unless (member (second arg) '(string number boolean) :test #'equal)
-      (error "Unsupported defun-tool argument type: ~a" (second arg))))
-  ;; Generate code
-  (let ((name-str (if (symbolp name) (symbol-name name) name))
-        (arg-names (mapcar #'first args)))
-    `(progn
-       ;; Define and set the function in *tools*
-       (setf (gethash ,name-str *tools*)
-             (make-instance 'function-tool
-                            :name ,name-str
-                            :description ,description
-                            :parameters ',args
-                            :fn (lambda ,arg-names
-                                  ,@body))))))
+(defmacro defun-tool (name args description &rest options-and-body)
+  ;; Parse options and body
+  (let ((body nil)
+        (safety-level nil)
+        (category nil)
+        (context-vars nil)
+        (requires-approval nil)
+        (approval-description nil)
+        (permission-callback nil)
+        (on-start nil)
+        (on-complete nil)
+        (on-error nil)
+        (parameter-validators nil))
+
+    ;; Parse keyword options
+    (loop for item in options-and-body
+          do (cond
+               ((and (listp item) (keywordp (first item)))
+                (case (first item)
+                  (:safety-level (setf safety-level (second item)))
+                  (:category (setf category (second item)))
+                  (:context-vars (setf context-vars (rest item)))
+                  (:requires-approval (setf requires-approval (second item)))
+                  (:approval-description (setf approval-description (second item)))
+                  (:permission-callback (setf permission-callback (second item)))
+                  (:on-start (setf on-start (second item)))
+                  (:on-complete (setf on-complete (second item)))
+                  (:on-error (setf on-error (second item)))
+                  (:parameter-validators (setf parameter-validators (rest item)))))
+               (t (push item body))))
+
+    (setf body (nreverse body))
+
+    (unless (listp args)
+      (error "ARGS must be a list."))
+    (unless (stringp description)
+      (error "DESCRIPTION must be a string."))
+    (dolist (arg args)
+      (unless (member (second arg) '(string number boolean) :test #'equal)
+        (error "Unsupported defun-tool argument type: ~a" (second arg))))
+
+    (let ((name-str (if (symbolp name) (symbol-name name) name))
+          (arg-names (mapcar #'first args)))
+      `(progn
+         ;; Define and set the function in *tools*
+         (setf (gethash ,name-str *tools*)
+               (make-instance 'function-tool
+                              :name ,name-str
+                              :description ,description
+                              :parameters ',args
+                              :safety-level ,(or safety-level '*default-safety-level*)
+                              :category ',category
+                              :context-vars ',context-vars
+                              :requires-approval ,requires-approval
+                              :approval-description ,approval-description
+                              :permission-callback ,permission-callback
+                              :on-start ,on-start
+                              :on-complete ,on-complete
+                              :on-error ,on-error
+                              :parameter-validators ',parameter-validators
+                              :fn (lambda ,arg-names
+                                    (execute-tool
+                                     ,name-str
+                                     (list ,@(mapcar (lambda (arg) `(cons ',(first arg) ,(first arg))) arg-names))
+                                     (lambda () ,@body)))))
+
+         ;; Register tool metadata
+         ,(when category
+            `(setf (gethash ,name-str *tool-categories*) ',category))
+         ,(when safety-level
+            `(setf (gethash ,name-str *safe-tools*) ,safety-level))))))
+
+(defun execute-tool (tool-name args body-fn)
+  "Execute a tool with permission checks, context binding, hooks, etc."
+  (let ((tool (gethash tool-name *tools*)))
+    (unless tool
+      (error "Unknown tool: ~A" tool-name))
+
+    (with-slots (safety-level requires-approval approval-description permission-callback
+                 context-vars on-start on-complete on-error parameter-validators) tool
+
+      ;; Parameter validation
+      (when parameter-validators
+        (validate-tool-parameters tool-name args parameter-validators))
+
+      ;; Permission check
+      (when (or requires-approval
+                (and safety-level (eq safety-level :requires-approval)))
+        (let* ((description (if (functionp approval-description)
+                                (funcall approval-description args)
+                                (or approval-description
+                                    (format nil "Execute ~A" tool-name))))
+               (callback (or permission-callback *permission-callback*)))
+          (unless (and callback (funcall callback tool-name args description))
+            (error "Tool execution denied: ~A" tool-name))))
+
+      ;; Execute with context binding and hooks
+      (handler-case
+          (let (result)
+            ;; Start hooks
+            (when on-start
+              (funcall on-start args))
+            (dolist (hook *tool-start-hooks*)
+              (funcall hook tool-name args))
+
+            ;; Context binding
+            (if context-vars
+                (progv context-vars
+                       (mapcar #'symbol-value context-vars)
+                  (setf result (funcall body-fn)))
+                (setf result (funcall body-fn)))
+
+            ;; Complete hooks
+            (when on-complete
+              (funcall on-complete result))
+            (dolist (hook *tool-complete-hooks*)
+              (funcall hook tool-name result))
+
+            result)
+        (error (e)
+          ;; Error hooks
+          (when on-error
+            (funcall on-error e))
+          (dolist (hook *tool-error-hooks*)
+            (funcall hook tool-name e))
+          (error e))))))
+
+;; Tool discovery and introspection functions
+(defun list-available-tools ()
+  "Return a list of all available tool names"
+  (loop for tool-name being the hash-keys of *tools*
+        collect tool-name))
+
+(defun get-tool-info (tool-name)
+  "Get detailed information about a tool"
+  (let ((tool (gethash (if (symbolp tool-name) (symbol-name tool-name) tool-name) *tools*)))
+    (when tool
+      (with-slots (description parameters safety-level category requires-approval) tool
+        (list :name tool-name
+              :description description
+              :parameters parameters
+              :safety-level safety-level
+              :category category
+              :requires-approval requires-approval)))))
+
+(defun get-tools-by-category (category)
+  "Get all tools in a specific category"
+  (loop for tool-name being the hash-keys of *tool-categories*
+        for tool-category being the hash-values of *tool-categories*
+        when (eq tool-category category)
+        collect tool-name))
+
+(defun get-tools-by-safety-level (safety-level)
+  "Get all tools with a specific safety level"
+  (loop for tool-name being the hash-keys of *safe-tools*
+        for tool-safety being the hash-values of *safe-tools*
+        when (eq tool-safety safety-level)
+        collect tool-name))
+
+(defun get-tool-safety-level (tool-name)
+  "Get the safety level of a tool"
+  (gethash (if (symbolp tool-name) (symbol-name tool-name) tool-name) *safe-tools*))
+
+(defun set-tool-safety-level (tool-name safety-level)
+  "Set the safety level of a tool"
+  (setf (gethash (if (symbolp tool-name) (symbol-name tool-name) tool-name) *safe-tools*) safety-level))
+
+(defun validate-tool-parameters (tool-name args validators)
+  "Validate tool parameters using provided validators"
+  (dolist (validator validators)
+    (let ((param-name (first validator))
+          (validator-fn (second validator)))
+      (let ((param-value (cdr (assoc param-name args))))
+        (unless (funcall validator-fn param-value)
+          (error "Parameter validation failed for ~A in tool ~A" param-name tool-name))))))
 
 (defun read-streamed-json-objects (stream streaming-callback)
   (loop for line = (read-line stream nil 'eof)
         when *debug-stream*
           do (format *debug-stream* "~&completions line: ~A~%" line)
         until (or (eq line 'eof) (string= "data: [DONE]" line))
-        when (and (> (length line) 6) (str:starts-with? "data: {" line))
+        when (and (> (length line) 6) (string= "data: {" (subseq line 0 7)))
         collect (let ((json (json:decode-json-from-string (subseq line 6))))
                   (let ((first-choice (cdr (assoc :delta (car (cdr (assoc :choices json)))))))
                     (unless (assoc :tool--calls first-choice)
@@ -218,7 +410,7 @@
                                                              (render tool)
                                                              (error "Undefined tool function: ~A" tool-symbol))))))
            (payload-format-string
-             (format nil "{ \"model\": ~S, \"stream\": ~A, ~A ~A \"messages\": ~~A, \"max_tokens\": ~A }"
+             (format nil "{ \"model\": ~S, \"stream\": ~A, ~A ~A \"messages\": ~~A, \"max_completion_tokens\": ~A }"
                      model
                      (if streaming-callback "true" "false")
                      (if tools (format nil "\"tools\": ~A," tools-rendered) "")

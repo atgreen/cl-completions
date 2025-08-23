@@ -2,7 +2,7 @@
 ;;;
 ;;; SPDX-License-Identifier: MIT
 ;;;
-;;; Copyright (C) 2024  Anthony Green <green@moxielogic.com>
+;;; Copyright (C) 2024, 2025  Anthony Green <green@moxielogic.com>
 ;;;
 ;;; Permission is hereby granted, free of charge, to any person obtaining a copy
 ;;; of this software and associated documentation files (the "Software"), to deal
@@ -25,4 +25,18 @@
 
 (defpackage #:completions
   (:use #:cl)
-  (:export completer openai-completer ollama-completer anthropic-completer get-completion defun-tool *read-timeout* *debug-stream*))
+  (:export completer openai-completer ollama-completer anthropic-completer get-completion defun-tool *read-timeout* *debug-stream*
+           ;; Permission and safety system
+           *permission-callback* *default-safety-level* *safe-tools*
+           ;; Tool classification
+           get-tool-safety-level set-tool-safety-level
+           ;; Context binding
+           *tool-context-vars*
+           ;; Event hooks
+           *tool-start-hooks* *tool-complete-hooks* *tool-error-hooks*
+           ;; Tool discovery and introspection
+           list-available-tools get-tool-info get-tools-by-category get-tools-by-safety-level
+           ;; Enhanced parameter validation
+           validate-tool-parameters
+           ;; Tool categories
+           *tool-categories*))
