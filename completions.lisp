@@ -148,9 +148,9 @@
             ;; Convert flat list (param1 validator1 param2 validator2...) to pairs
             (let ((validator-list (rest item)))
               (setf parameter-validators 
-                    `',(loop for i from 0 below (length validator-list) by 2
-                             when (< (1+ i) (length validator-list))
-                             collect (list (nth i validator-list) (nth (1+ i) validator-list))))))))
+                    (loop for i from 0 below (length validator-list) by 2
+                          when (< (1+ i) (length validator-list))
+                          collect (list (nth i validator-list) (nth (1+ i) validator-list))))))))
         (t (push item body))))
 
     (setf body (nreverse body))
@@ -183,7 +183,10 @@
                               :on-start ,on-start
                               :on-complete ,on-complete
                               :on-error ,on-error
-                              :parameter-validators ,parameter-validators
+                              :parameter-validators ,(when parameter-validators
+                                                        `(list ,@(mapcar (lambda (pair)
+                                                                           `(list ',(first pair) ,(second pair)))
+                                                                         parameter-validators)))
                               :fn ,(if (or safety-level category context-vars requires-approval
                                            approval-description permission-callback on-start on-complete
                                            on-error parameter-validators)
