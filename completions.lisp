@@ -130,25 +130,32 @@
         (on-error nil)
         (parameter-validators nil))
 
-    ;; Parse keyword options
-    (loop for item in options-and-body
-          do (cond
-               ((and (listp item) (keywordp (first item)))
-                (case (first item)
-                  (:safety-level (setf safety-level (second item)))
-                  (:category (setf category (second item)))
-                  (:context-vars (setf context-vars (rest item)))
-                  (:requires-approval (setf requires-approval (second item)))
-                  (:approval-description (setf approval-description (second item)))
-                  (:permission-callback (setf permission-callback (second item)))
-                  (:on-start (setf on-start (second item)))
-                  (:on-complete (setf on-complete (second item)))
-                  (:on-error (setf on-error (second item)))
-                  (:parameter-validators (setf parameter-validators (rest item)))))
-               (t (push item body))))
+    ;; Parse keyword options and body
+    (dolist (item options-and-body)
+      (cond
+        ((and (listp item) (keywordp (first item)))
+         (case (first item)
+           (:safety-level (setf safety-level (second item)))
+           (:category (setf category (second item)))
+           (:context-vars (setf context-vars (rest item)))
+           (:requires-approval (setf requires-approval (second item)))
+           (:approval-description (setf approval-description (second item)))
+           (:permission-callback (setf permission-callback (second item)))
+           (:on-start (setf on-start (second item)))
+           (:on-complete (setf on-complete (second item)))
+           (:on-error (setf on-error (second item)))
+           (:parameter-validators 
+            ;; Convert flat list (param1 validator1 param2 validator2...) to pairs
+            (let ((validator-list (rest item)))
+              (setf parameter-validators 
+                    `',(loop for i from 0 below (length validator-list) by 2
+                             when (< (1+ i) (length validator-list))
+                             collect (list (nth i validator-list) (nth (1+ i) validator-list))))))))
+        (t (push item body))))
 
     (setf body (nreverse body))
 
+    ;; Compile time checks
     (unless (listp args)
       (error "ARGS must be a list."))
     (unless (stringp description)
@@ -157,6 +164,7 @@
       (unless (member (second arg) '(string number boolean) :test #'equal)
         (error "Unsupported defun-tool argument type: ~a" (second arg))))
 
+    ;; Generate code
     (let ((name-str (if (symbolp name) (symbol-name name) name))
           (arg-names (mapcar #'first args)))
       `(progn
@@ -175,12 +183,19 @@
                               :on-start ,on-start
                               :on-complete ,on-complete
                               :on-error ,on-error
-                              :parameter-validators ',parameter-validators
-                              :fn (lambda ,arg-names
-                                    (execute-tool
-                                     ,name-str
-                                     (list ,@(mapcar (lambda (arg) `(cons ',(first arg) ,(first arg))) arg-names))
-                                     (lambda () ,@body)))))
+                              :parameter-validators ,parameter-validators
+                              :fn ,(if (or safety-level category context-vars requires-approval
+                                           approval-description permission-callback on-start on-complete
+                                           on-error parameter-validators)
+                                       ;; Enhanced tool using execute-tool
+                                       `(lambda ,arg-names
+                                          (execute-tool
+                                           ,name-str
+                                           (list ,@(mapcar (lambda (arg-name) `(cons ',arg-name ,arg-name)) arg-names))
+                                           (lambda () ,@body)))
+                                       ;; Basic tool
+                                       `(lambda ,arg-names
+                                          ,@body))))
 
          ;; Register tool metadata
          ,(when category
