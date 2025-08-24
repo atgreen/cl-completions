@@ -166,7 +166,7 @@
 
     ;; Generate code
     (let ((name-str (if (symbolp name) (symbol-name name) name))
-          (arg-names (mapcar #'first args)))
+          (arg-names (mapcar (lambda (arg) (intern (string-upcase (first arg)))) args)))
       `(progn
          ;; Define and set the function in *tools*
          (setf (gethash ,name-str *tools*)
