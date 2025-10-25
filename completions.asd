@@ -23,7 +23,7 @@
 ;;; SOFTWARE.
 ;;;
 
-(asdf:defsystem #:completions
+(asdf:defsystem "completions"
   :description "A Common Lisp LLM completions library"
   :author "Anthony Green <green@moxielogic.com>"
   :license "MIT"

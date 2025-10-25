@@ -138,26 +138,27 @@
 
     ;; Parse keyword options and body
     (dolist (item options-and-body)
-      (cond
-        ((and (listp item) (keywordp (first item)))
-         (case (first item)
-           (:safety-level (setf safety-level (second item)))
-           (:category (setf category (second item)))
-           (:context-vars (setf context-vars (rest item)))
-           (:requires-approval (setf requires-approval (second item)))
-           (:approval-description (setf approval-description (second item)))
-           (:permission-callback (setf permission-callback (second item)))
-           (:on-start (setf on-start (second item)))
-           (:on-complete (setf on-complete (second item)))
-           (:on-error (setf on-error (second item)))
-           (:parameter-validators
-            ;; Convert flat list (param1 validator1 param2 validator2...) to pairs
-            (let ((validator-list (rest item)))
-              (setf parameter-validators
-                    (loop for i from 0 below (length validator-list) by 2
-                          when (< (1+ i) (length validator-list))
-                          collect (list (nth i validator-list) (nth (1+ i) validator-list))))))))
-        (t (push item body))))
+      (if (and (listp item) (keywordp (first item)))
+          (case (first item)
+            (:safety-level (setf safety-level (second item)))
+            (:category (setf category (second item)))
+            (:context-vars (setf context-vars (rest item)))
+            (:requires-approval (setf requires-approval (second item)))
+            (:approval-description (setf approval-description (second item)))
+            (:permission-callback (setf permission-callback (second item)))
+            (:on-start (setf on-start (second item)))
+            (:on-complete (setf on-complete (second item)))
+            (:on-error (setf on-error (second item)))
+            (:parameter-validators
+             ;; Convert flat list (param1 validator1 param2 validator2...) to pairs
+             (let ((validator-list (rest item)))
+               (setf parameter-validators
+                     (loop for i from 0 below (length validator-list) by 2
+                           when (< (1+ i) (length validator-list))
+                           collect (list (nth i validator-list) (nth (1+ i) validator-list))))))
+            (otherwise
+             (error "Unknown option ~S in defun-tool" (first item))))
+          (push item body)))
 
     (setf body (nreverse body))
 
@@ -393,7 +394,7 @@
                                      ;; Try common dexador error types
                                      (dex:http-request-failed
                                       (dex:response-body e))
-                                     (t nil)))))
+                                     (otherwise nil)))))
                   (when (typep body '(vector (unsigned-byte 8)))
                     ;; Convert byte array to string and signal a new error with string body
                     (let ((string-body (convert-byte-array-to-utf8 body)))
