@@ -15,21 +15,21 @@ To use the ollama API:
 
 ```
 (let ((completer (make-instance 'ollama-completer :model "mistral:latest")))
-  (get-completion completer "It's a beautiful day for " 100))
+  (get-completion completer "It's a beautiful day for " :max-tokens 100))
 ```
 
 To use the OpenAI API:
 
 ```
 (let ((completer (make-instance 'openai-completer :api-key (uiop:getenv "OPENAI_API_KEY"))))
-  (get-completion completer "It's a beautiful day for " 100))
+  (get-completion completer "It's a beautiful day for " :max-tokens 100))
 ```
 
 To use the Anthropic API:
 
 ```
 (let ((completer (make-instance 'anthropic-completer :api-key (uiop:getenv "ANTHROPIC_API_KEY"))))
-  (get-completion completer "It's a beautiful day for " 100))
+  (get-completion completer "It's a beautiful day for " :max-tokens 100))
 ```
 
 ## Tool Functions

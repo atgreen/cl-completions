@@ -62,7 +62,8 @@
   "List of functions to call when a tool encounters an error")
 
 (defclass completer ()
-  ())
+  ()
+  (:documentation "Base class for completion providers."))
 
 (defclass openai-completer (completer)
   ((endpoint :initform "https://api.openai.com/v1/chat/completions" :initarg :endpoint)
@@ -70,20 +71,24 @@
    (prompt-token-count :initform 0)
    (completion-token-count :initform 0)
    (model :initarg :model :initform "gpt-4")
-   (tools :initarg :tools :initform (list))))
+   (tools :initarg :tools :initform (list)))
+  (:documentation "OpenAI completion provider supporting chat completions and tool calls."))
 
 (defclass anthropic-completer (completer)
   ((endpoint :initform "https://api.anthropic.com/v1/messages" :initarg :endpoint)
    (api-key :initarg :api-key)
    (model :initarg :model :initform "claude-3-opus-20240229")
-   (tools :initarg :tools :initform (list))))
+   (tools :initarg :tools :initform (list)))
+  (:documentation "Anthropic Claude completion provider supporting chat messages."))
 
 (defclass ollama-completer (completer)
   ((endpoint :initform "http://localhost:11434/api/chat" :initarg :endpoint)
-   (model :initarg :model)))
+   (model :initarg :model))
+  (:documentation "Ollama completion provider for local LLM inference."))
 
 (defclass tool ()
-  ())
+  ()
+  (:documentation "Base class for tools that can be called by LLM completions."))
 
 (defclass function-tool (tool)
   ((description :initarg :description)
@@ -99,7 +104,8 @@
    (on-start :initarg :on-start :initform nil)
    (on-complete :initarg :on-complete :initform nil)
    (on-error :initarg :on-error :initform nil)
-   (parameter-validators :initarg :parameter-validators :initform nil)))
+   (parameter-validators :initarg :parameter-validators :initform nil))
+  (:documentation "Function-based tool with support for permissions, validation, and lifecycle hooks."))
 
 (defmethod render ((tool function-tool))
   (with-slots (description name parameters) tool
@@ -109,14 +115,14 @@
                     ,(when parameters
                        `(:parameters . ((:type . "object")
                                         (:properties . ,(loop for p in parameters
-                                                              collect (cons (first p)
-                                                                            (list
-                                                                             (cons :type (second p))
-                                                                             (cons :description (third p))))))
+                                                              collect (list (first p)
+                                                                            (cons :type (second p))
+                                                                            (cons :description (third p)))))
                                         (:required . ,(loop for p in parameters
                                                             collect (first p)))))))))))
 
 (defmacro defun-tool (name args description &rest options-and-body)
+  "Define a tool function that can be called by LLM completions with optional safety and validation features."
   ;; Parse options and body
   (let ((body nil)
         (safety-level nil)
@@ -144,10 +150,10 @@
            (:on-start (setf on-start (second item)))
            (:on-complete (setf on-complete (second item)))
            (:on-error (setf on-error (second item)))
-           (:parameter-validators 
+           (:parameter-validators
             ;; Convert flat list (param1 validator1 param2 validator2...) to pairs
             (let ((validator-list (rest item)))
-              (setf parameter-validators 
+              (setf parameter-validators
                     (loop for i from 0 below (length validator-list) by 2
                           when (< (1+ i) (length validator-list))
                           collect (list (nth i validator-list) (nth (1+ i) validator-list))))))))
@@ -174,7 +180,7 @@
                               :name ,name-str
                               :description ,description
                               :parameters ',args
-                              :safety-level ,(or safety-level '*default-safety-level*)
+                              :safety-level ,(or safety-level *default-safety-level*)
                               :category ',category
                               :context-vars ',context-vars
                               :requires-approval ,requires-approval
@@ -203,8 +209,13 @@
          ;; Register tool metadata
          ,(when category
             `(setf (gethash ,name-str *tool-categories*) ',category))
-         ,(when safety-level
-            `(setf (gethash ,name-str *safe-tools*) ,safety-level))))))
+         ;; Always register safety level (explicit or default)
+         (setf (gethash ,name-str *safe-tools*) ,(or safety-level *default-safety-level*))))))
+
+(defun map-args-to-parameters (fn-tool args)
+  "Map JSON arguments to tool parameters in the declared order."
+  (loop for (param-name param-type param-desc) in (slot-value fn-tool 'parameters)
+        collect (rest (assoc (intern (string-upcase param-name) :keyword) args))))
 
 (defun execute-tool (tool-name args body-fn)
   "Execute a tool with permission checks, context binding, hooks, etc."
@@ -221,7 +232,7 @@
 
       ;; Permission check
       (when (or requires-approval
-                (and safety-level (eq safety-level :requires-approval)))
+                (and safety-level (eql safety-level :requires-approval)))
         (let* ((description (if (functionp approval-description)
                                 (funcall approval-description args)
                                 (or approval-description
@@ -269,15 +280,14 @@
 
 (defun get-tool-info (tool-name)
   "Get detailed information about a tool"
-  (let ((tool (gethash (if (symbolp tool-name) (symbol-name tool-name) tool-name) *tools*)))
-    (when tool
-      (with-slots (description parameters safety-level category requires-approval) tool
-        (list :name tool-name
-              :description description
-              :parameters parameters
-              :safety-level safety-level
-              :category category
-              :requires-approval requires-approval)))))
+  (when-let ((tool (gethash (if (symbolp tool-name) (symbol-name tool-name) tool-name) *tools*)))
+    (with-slots (description parameters safety-level category requires-approval) tool
+      (list :name tool-name
+            :description description
+            :parameters parameters
+            :safety-level safety-level
+            :category category
+            :requires-approval requires-approval))))
 
 (defun get-tools-by-category (category)
   "Get all tools in a specific category"
@@ -306,53 +316,101 @@
   (dolist (validator validators)
     (let ((param-name (first validator))
           (validator-fn (second validator)))
-      (let ((param-value (cdr (assoc param-name args))))
+      (let ((param-value (rest (assoc param-name args))))
         (unless (funcall validator-fn param-value)
           (error "Parameter validation failed for ~A in tool ~A" param-name tool-name))))))
 
 (defun read-streamed-json-objects (stream streaming-callback)
+  "Read and process streamed JSON objects from STREAM, calling STREAMING-CALLBACK for each content chunk."
   (loop for line = (read-line stream nil 'eof)
         when *debug-stream*
           do (format *debug-stream* "~&completions line: ~A~%" line)
         until (or (eq line 'eof) (string= "data: [DONE]" line))
-        when (and (> (length line) 6) (string= "data: {" (subseq line 0 7)))
-        collect (let ((json (json:decode-json-from-string (subseq line 6))))
-                  (let ((first-choice (cdr (assoc :delta (car (cdr (assoc :choices json)))))))
+        when (and (> (length line) 6) (string= "data: {" (take 7 line)))
+        collect (let ((json (json:decode-json-from-string (drop 6 line))))
+                  (let ((first-choice (rest (assoc :delta (second (assoc :choices json))))))
                     (unless (assoc :tool--calls first-choice)
-                      (let ((text (cdr (assoc :content first-choice))))
-                        (when text
-                          (funcall streaming-callback text)))))
+                      (when-let ((text (rest (assoc :content first-choice))))
+                        (funcall streaming-callback text))))
                   json)))
 
-(defun concatenate-arguments (sexps)
-  "Concatenate all arguments for the given index from the list of s-expressions."
-  (let ((argument-strings '()))
-    ;; Loop through each s-expression.
-    (dolist (sexp sexps)
-      ;; Navigate through the nested structure to find the :TOOL--CALLS.
-      (let* ((choices (cdr (assoc :CHOICES sexp)))
-             (delta (cdr (assoc :DELTA (car choices))))
-             (tool-calls (cdr (assoc :TOOL--CALLS delta))))
-        ;; Loop through each :TOOL--CALLS entry.
-        (dolist (call tool-calls)
-          ;; Add the argument string to the list if the index matches.
-          (let ((args (cdr (assoc :ARGUMENTS (cdr (assoc :FUNCTION call))))))
-            (push args argument-strings)))))
-    ;; Concatenate all collected argument strings in reverse order to maintain the original order.
-    (apply #'concatenate 'string (reverse argument-strings))))
+(defun detect-tool-calls-in-stream (objs)
+  "Detect if any tool-calls appear in the streamed objects."
+  (loop for obj in objs
+        thereis (let* ((choices (rest (assoc :CHOICES obj)))
+                       (delta (rest (assoc :DELTA (first choices))))
+                       (tool-calls (rest (assoc :TOOL--CALLS delta))))
+                  tool-calls)))
+
+(defun accumulate-tool-calls (objs)
+  "Accumulate tool-call arguments per ID from streaming objects."
+  (let ((tool-call-map (make-hash-table :test 'equal)))
+    (loop for obj in objs
+          do (let* ((choices (rest (assoc :CHOICES obj)))
+                   (delta (rest (assoc :DELTA (first choices))))
+                   (tool-calls (rest (assoc :TOOL--CALLS delta))))
+               (when tool-calls
+                 (loop for tool-call in tool-calls
+                       do (let ((id (rest (assoc :ID tool-call)))
+                               (func (rest (assoc :FUNCTION tool-call))))
+                            (when id
+                              (unless (gethash id tool-call-map)
+                                (setf (gethash id tool-call-map) (list :id id :function nil :arguments "")))
+                              (when func
+                                (let ((name (rest (assoc :NAME func)))
+                                     (args (rest (assoc :ARGUMENTS func))))
+                                  (when name
+                                    (setf (getf (gethash id tool-call-map) :function) func))
+                                  (when args
+                                    (setf (getf (gethash id tool-call-map) :arguments)
+                                          (concatenate 'string
+                                                      (getf (gethash id tool-call-map) :arguments)
+                                                      args)))))))))))
+    ;; Convert to list of complete tool-calls
+    (loop for id being the hash-keys of tool-call-map
+          for call-data = (gethash id tool-call-map)
+          when (and (getf call-data :function)
+                   (not (string= (getf call-data :arguments) "")))
+          collect (list (cons :id id)
+                       (cons :function (getf call-data :function))))))
 
 (defun convert-byte-array-to-utf8 (byte-array)
+  "Convert a byte array to a UTF-8 string, trying multiple encodings if necessary."
   (let ((encodings '(:utf-8 :iso-8859-1 :windows-1252)))
     (loop for encoding in encodings
           do (handler-case
                  (return (babel:octets-to-string byte-array :encoding encoding :errorp t))
-               (error () (when *debug-stream* (format *debug-stream* "~&*BARF* on string conversion~%")) nil)))))
+               (error () (when *debug-stream* (format *debug-stream* "~&*BARF* on string conversion~%")) nil))
+          finally (return (babel:octets-to-string byte-array :encoding :latin-1)))))
+
+(defun safe-http-request (&rest args)
+  "Wrapper around dex:post that converts error response bodies from byte arrays to strings."
+  (handler-bind
+      ((error (lambda (e)
+                ;; Try to get the response body from the error condition
+                (when-let ((body (ignore-errors
+                                   (typecase e
+                                     ;; Try common dexador error types
+                                     (dex:http-request-failed
+                                      (dex:response-body e))
+                                     (t nil)))))
+                  (when (typep body '(vector (unsigned-byte 8)))
+                    ;; Convert byte array to string and signal a new error with string body
+                    (let ((string-body (convert-byte-array-to-utf8 body)))
+                      (error 'dex:http-request-failed
+                             :body string-body
+                             :status (dex:response-status e)
+                             :headers (dex:response-headers e)
+                             :uri (dex:request-uri e)
+                             :method (dex:request-method e))))))))
+    (apply #'dex:post args)))
 
 (defun completions-loop (provider endpoint headers messages payload-format-string streaming-callback)
+  "Main loop for handling completions, including streaming and tool call execution."
   (let ((payload (format nil payload-format-string (json:encode-json-to-string messages)))
         (objs))
     (if streaming-callback
-        (let* ((response-stream (dex:post endpoint
+        (let* ((response-stream (safe-http-request endpoint
                                           :read-timeout *read-timeout*
                                           :content payload
                                           :headers headers
@@ -360,62 +418,58 @@
           (unwind-protect
                (setf objs (read-streamed-json-objects response-stream streaming-callback))
             (close response-stream))
-          (let ((tool-calls (cdr (assoc :tool--calls (cdr (assoc :delta (car (cdr (assoc :choices (car objs))))))))))
-            (if tool-calls
-                (let* ((arg-string (concatenate-arguments objs))
-                       (tool-answers (loop for tool-call in tool-calls
-                                           do (setf (cdr (assoc :arguments (cdr (assoc :function tool-call)))) arg-string)
-                                           collect (let* ((args (json:decode-json-from-string arg-string))
-                                                          (fn-name (cdr (assoc :NAME (cdr (assoc :FUNCTION tool-call)))))
-                                                          (fn-tool (gethash fn-name *tools*)))
-                                                     `((:role . "tool")
-                                                       (:tool_call_id . ,(cdr (assoc :id tool-call)))
-                                                       (:content . ,(apply (slot-value fn-tool 'fn)
-                                                                           (loop for arg in args collect (cdr arg)))))))))
-                  (completions-loop provider endpoint headers (append messages
-                                                                      (loop for tool-call in tool-calls
-                                                                            collect `(("role" . "assistant")
-                                                                                      ("content" . nil)
-                                                                                      ("tool_calls" . ,(list tool-call))))
-                                                                      tool-answers)
-                                    payload-format-string streaming-callback))
-              (with-output-to-string (s)
-                (loop for obj in objs
-                      do (let ((content (cdr (assoc :content (cdr (assoc :delta (car (cdr (assoc :choices obj)))))))))
-                           (when content
-                             (princ content s))))))))
+          (if-let ((has-tool-calls (detect-tool-calls-in-stream objs)))
+              (let* ((tool-calls (accumulate-tool-calls objs))
+                     (tool-answers (loop for tool-call in tool-calls
+                                         collect (let* ((fn-name (rest (assoc :NAME (rest (assoc :FUNCTION tool-call)))))
+                                                        (fn-tool (gethash fn-name *tools*))
+                                                        (args (json:decode-json-from-string (rest (assoc :ARGUMENTS (rest (assoc :FUNCTION tool-call)))))))
+                                                   `((:role . "tool")
+                                                     (:tool_call_id . ,(rest (assoc :id tool-call)))
+                                                     (:content . ,(apply (slot-value fn-tool 'fn)
+                                                                         (map-args-to-parameters fn-tool args)))))))))
+            (completions-loop provider endpoint headers (append messages
+                                                                (loop for tool-call in tool-calls
+                                                                      collect `(("role" . "assistant")
+                                                                                ("content" . nil)
+                                                                                ("tool_calls" . ,(list tool-call))))
+                                                                tool-answers)
+                              payload-format-string streaming-callback))
+          (with-output-to-string (s)
+            (loop for obj in objs
+                  do (when-let ((content (rest (assoc :content (second (assoc :delta (assoc :choices obj)))))))
+                       (princ content s)))))
 
-      ;; Non-streaming...
-      (let ((objs (json:decode-json-from-string
-                   (convert-byte-array-to-utf8
-                    (let ((ba (dex:post endpoint
-                                        :read-timeout *read-timeout*
-                                        :content payload
-                                        :headers headers
-                                        :force-binary t
-                                        :want-stream nil)))
-                      (when *debug-stream* (print ba))
-                      ba)))))
-        (when *debug-stream*
-          (format *debug-stream* "~&api call result: ~A~%" objs))
-        (let ((tool-calls (cdr (assoc :tool--calls (cdr (assoc :message (car (cdr (assoc :choices objs)))))))))
-          (if tool-calls
+  ;; Non-streaming...
+  (let ((objs (json:decode-json-from-string
+         (convert-byte-array-to-utf8
+                      (let ((ba (safe-http-request endpoint
+            :read-timeout *read-timeout*
+            :content payload
+            :headers headers
+            :force-binary t
+            :want-stream nil)))
+      (when *debug-stream* (print ba))
+      ba)))))
+    (when *debug-stream*
+      (format *debug-stream* "~&api call result: ~A~%" objs))
+    (if-let ((tool-calls (rest (assoc :tool--calls (rest (assoc :message (second (assoc :choices objs))))))))
               (let ((tool-answers (loop for tool-call in tool-calls
-                                        collect (let* ((args (json:decode-json-from-string (cdr (assoc :ARGUMENTS (cdr (assoc :FUNCTION tool-call))))))
-                                                       (fn-name (cdr (assoc :NAME (cdr (assoc :FUNCTION tool-call)))))
-                                                       (fn-tool (gethash fn-name *tools*)))
-                                                  `((:role . "tool")
-                                                    (:tool_call_id . ,(cdr (assoc :id tool-call)))
-                                                    (:content . ,(apply (slot-value fn-tool 'fn)
-                                                                        (loop for arg in args collect (cdr arg)))))))))
-                (completions-loop provider endpoint headers (append messages
-                                                                    (loop for tool-call in tool-calls
-                                                                          collect `(("role" . "assistant")
-                                                                                    ("content" . nil)
-                                                                                    ("tool_calls" . ,(list tool-call))))
-                                                                    tool-answers)
-                                  payload-format-string nil))
-            (cdr (assoc :content (cdr (assoc :message (cadr (assoc :choices objs))))))))))))
+          collect (let* ((args (json:decode-json-from-string (rest (assoc :ARGUMENTS (rest (assoc :FUNCTION tool-call))))))
+                   (fn-name (rest (assoc :NAME (rest (assoc :FUNCTION tool-call)))))
+                   (fn-tool (gethash fn-name *tools*)))
+              `((:role . "tool")
+                (:tool_call_id . ,(rest (assoc :id tool-call)))
+                (:content . ,(apply (slot-value fn-tool 'fn)
+                  (map-args-to-parameters fn-tool args))))))))
+    (completions-loop provider endpoint headers (append messages
+                    (loop for tool-call in tool-calls
+                    collect `(("role" . "assistant")
+                        ("content" . nil)
+                        ("tool_calls" . ,(list tool-call))))
+                    tool-answers)
+          payload-format-string nil))
+      (rest (assoc :content (rest (assoc :message (second (assoc :choices objs)))))))))))
 
 (defmethod get-completion ((provider openai-completer) messages &key (max-tokens 1024) (streaming-callback nil) (response-format nil))
   (when (stringp messages)
@@ -423,12 +477,11 @@
   (with-slots (endpoint api-key model completion-token-count prompt-token-count tools) provider
     (let* ((tools-rendered
              (json:encode-json-to-string (loop for tool-symbol in tools
-                                               collect (let ((tool (gethash (symbol-name tool-symbol) *tools*)))
-                                                         (if tool
-                                                             (render tool)
-                                                             (error "Undefined tool function: ~A" tool-symbol))))))
+                                               collect (if-let ((tool (gethash (symbol-name tool-symbol) *tools*)))
+                                                         (render tool)
+                                                         (error "Undefined tool function: ~A" tool-symbol)))))
            (payload-format-string
-             (format nil "{ \"model\": ~S, \"stream\": ~A, ~A ~A \"messages\": ~~A, \"max_completion_tokens\": ~A }"
+             (format nil "{ \"model\": ~S, \"stream\": ~A, ~A ~A \"messages\": ~~A, \"max_tokens\": ~A }"
                      model
                      (if streaming-callback "true" "false")
                      (if tools (format nil "\"tools\": ~A," tools-rendered) "")
@@ -438,7 +491,7 @@
                       ("Authorization" . ,(concatenate 'string "Bearer " api-key)))))
       (let ((response (completions-loop provider endpoint headers messages payload-format-string streaming-callback)))
         (values response
-                (append messages (list `((:ROLE . "assistant") (:CONTENT . ,response)))))))))
+                (append1 messages `((:ROLE . "assistant") (:CONTENT . ,response))))))))
 
 
 (defmethod get-completion ((provider ollama-completer) messages &key (max-tokens 1024) (streaming-callback nil) (response-format nil))
@@ -457,7 +510,7 @@
 
       (if streaming-callback
 
-          (let ((response-stream (dex:post endpoint
+          (let ((response-stream (safe-http-request endpoint
                                            :read-timeout *read-timeout*
                                            :content content
                                            :headers headers
@@ -467,21 +520,21 @@
                          (with-output-to-string (sstream)
                            (loop
                              for json-object = (ignore-errors (json:decode-json-from-string (read-line response-stream)))
-                             until (or (null json-object) (cdr (assoc :done json-object)))
+                             until (or (null json-object) (rest (assoc :done json-object)))
                              do (progn
-                                  (format sstream "~A" (cdr (assoc :CONTENT (cdr (assoc :MESSAGE json-object)))))
-                                  (funcall streaming-callback (cdr (assoc :CONTENT (cdr (assoc :MESSAGE json-object))))))))
+                                  (format sstream "~A" (rest (assoc :CONTENT (rest (assoc :MESSAGE json-object)))))
+                                  (funcall streaming-callback (rest (assoc :CONTENT (rest (assoc :MESSAGE json-object))))))))
                       (close response-stream))))
                   (values response
-                          (append messages (list `((:ROLE . "assistant") (:CONTENT . ,response)))))))
+                          (append1 messages `((:ROLE . "assistant") (:CONTENT . ,response))))))
 
-          (let* ((response (json:decode-json-from-string
-                            (dex:post endpoint
+          (let ((response (json:decode-json-from-string
+                            (safe-http-request endpoint
                                       :read-timeout *read-timeout*
                                       :content content
                                       :headers headers))))
-            (values (cdr (assoc :content (cdr (assoc :message response))))
-                (append messages (list (cdr (assoc :message response))))))))))
+            (values (rest (assoc :content (rest (assoc :message response))))
+                (append1 messages (rest (assoc :message response)))))))))
 
 (defmethod get-completion ((provider anthropic-completer) messages &key (max-tokens 1024) (streaming-callback nil))
   (when (stringp messages)
@@ -502,11 +555,11 @@
                     (json:encode-json-to-string (make-array (length messages) :initial-contents messages))))
           (headers `(("x-api-key" . ,api-key)
                      ("anthropic-version" . "2023-06-01"))))
-      (let* ((response (json:decode-json-from-string
-                        (dex:post endpoint
+      (let ((response (json:decode-json-from-string
+                        (safe-http-request endpoint
                                   :read-timeout *read-timeout*
                                   :content content
                                   :headers headers
                                   :content-type "application/json"))))
-        (values (cdr (assoc :text (cadr (assoc :content response))))
+        (values (rest (assoc :text (second (assoc :content response))))
                 (append messages `(((:role . "assistant") ,(assoc :content response)))))))))

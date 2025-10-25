@@ -31,4 +31,4 @@
   :serial t
   :components ((:file "package")
                (:file "completions"))
-  :depends-on (:dexador :cl-json :flexi-streams :babel :str))
+  :depends-on (:dexador :cl-json :flexi-streams :babel :str :alexandria :serapeum))
