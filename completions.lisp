@@ -436,10 +436,14 @@
                                                                                 ("tool_calls" . ,(list tool-call))))
                                                                 tool-answers)
                               payload-format-string streaming-callback))
-          (with-output-to-string (s)
-            (loop for obj in objs
-                  do (when-let ((content (rest (assoc :content (second (assoc :delta (assoc :choices obj)))))))
-                       (princ content s)))))
+          (let ((response (with-output-to-string (s)
+                            (loop for obj in objs
+                                  do (when-let ((content (rest (assoc :content (second (assoc :delta (assoc :choices obj)))))))
+                                       (princ content s))))))
+            (values response
+                    (append1 messages
+                             `(("role" . "assistant")
+                               ("content" . ,response))))))
 
   ;; Non-streaming...
   (let ((objs (json:decode-json-from-string
@@ -470,7 +474,11 @@
                         ("tool_calls" . ,(list tool-call))))
                     tool-answers)
           payload-format-string nil))
-      (rest (assoc :content (rest (assoc :message (second (assoc :choices objs)))))))))))
+      (let ((response (rest (assoc :content (rest (assoc :message (second (assoc :choices objs))))))))
+        (values response
+                (append1 messages
+                         `(("role" . "assistant")
+                           ("content" . ,response))))))))))
 
 (defmethod get-completion ((provider openai-completer) messages &key (max-tokens 1024) (streaming-callback nil) (response-format nil))
   (when (stringp messages)
@@ -490,9 +498,7 @@
                      max-tokens))
            (headers `(("Content-Type" . "application/json")
                       ("Authorization" . ,(concatenate 'string "Bearer " api-key)))))
-      (let ((response (completions-loop provider endpoint headers messages payload-format-string streaming-callback)))
-        (values response
-                (append1 messages `((:ROLE . "assistant") (:CONTENT . ,response))))))))
+      (completions-loop provider endpoint headers messages payload-format-string streaming-callback))))
 
 
 (defmethod get-completion ((provider ollama-completer) messages &key (max-tokens 1024) (streaming-callback nil) (response-format nil))
