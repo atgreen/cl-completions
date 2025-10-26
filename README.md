@@ -32,6 +32,31 @@ To use the Anthropic API:
   (get-completion completer "It's a beautiful day for " :max-tokens 100))
 ```
 
+### Multi-turn Conversations
+
+`get-completion` returns two values: the completion text and the updated conversation history (including the assistant's response). This makes it easy to maintain context across multiple turns:
+
+```lisp
+(let ((completer (make-instance 'openai-completer
+                                :api-key (uiop:getenv "OPENAI_API_KEY")))
+      (messages '((("role" . "user")
+                   ("content" . "What's the capital of France?")))))
+  ;; First turn
+  (multiple-value-bind (response updated-messages)
+      (get-completion completer messages :max-tokens 100)
+    (format t "Assistant: ~A~%~%" response)
+
+    ;; Second turn - use updated-messages to maintain context
+    (setf messages (append updated-messages
+                          '((("role" . "user")
+                             ("content" . "What's its population?")))))
+    (multiple-value-bind (response2 updated-messages2)
+        (get-completion completer messages :max-tokens 100)
+      (format t "Assistant: ~A~%" response2))))
+```
+
+When tools are invoked, they are automatically included in the returned message history.
+
 ## Tool Functions
 
 The library provides a powerful `defun-tool` macro for creating LLM-callable functions with built-in permission management, safety classification, parameter validation, and event hooks.
