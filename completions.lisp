@@ -86,6 +86,12 @@
    (model :initarg :model))
   (:documentation "Ollama completion provider for local LLM inference."))
 
+(defclass gemini-completer (completer)
+  ((api-key :initarg :api-key)
+   (model :initarg :model :initform "gemini-2.0-flash")
+   (tools :initarg :tools :initform (list)))
+  (:documentation "Google Gemini completion provider."))
+
 (defclass tool ()
   ()
   (:documentation "Base class for tools that can be called by LLM completions."))
@@ -217,6 +223,12 @@
   "Map JSON arguments to tool parameters in the declared order."
   (loop for (param-name param-type param-desc) in (slot-value fn-tool 'parameters)
         collect (rest (assoc (intern (string-upcase param-name) :keyword) args))))
+
+(defun invoke-tool (fn-name args)
+  "Look up tool FN-NAME, call it with ARGS (a decoded alist), return result."
+  (let ((fn-tool (gethash fn-name *tools*)))
+    (unless fn-tool (error "Unknown tool: ~A" fn-name))
+    (apply (slot-value fn-tool 'fn) (map-args-to-parameters fn-tool args))))
 
 (defun execute-tool (tool-name args body-fn)
   "Execute a tool with permission checks, context binding, hooks, etc."
@@ -423,12 +435,10 @@
               (let* ((tool-calls (accumulate-tool-calls objs))
                      (tool-answers (loop for tool-call in tool-calls
                                          collect (let* ((fn-name (rest (assoc :NAME (rest (assoc :FUNCTION tool-call)))))
-                                                        (fn-tool (gethash fn-name *tools*))
                                                         (args (json:decode-json-from-string (rest (assoc :ARGUMENTS (rest (assoc :FUNCTION tool-call)))))))
                                                    `((:role . "tool")
                                                      (:tool_call_id . ,(rest (assoc :id tool-call)))
-                                                     (:content . ,(apply (slot-value fn-tool 'fn)
-                                                                         (map-args-to-parameters fn-tool args)))))))))
+                                                     (:content . ,(invoke-tool fn-name args))))))))
             (completions-loop provider endpoint headers (append messages
                                                                 (loop for tool-call in tool-calls
                                                                       collect `(("role" . "assistant")
@@ -461,12 +471,10 @@
     (if-let ((tool-calls (rest (assoc :tool--calls (rest (assoc :message (second (assoc :choices objs))))))))
               (let ((tool-answers (loop for tool-call in tool-calls
           collect (let* ((args (json:decode-json-from-string (rest (assoc :ARGUMENTS (rest (assoc :FUNCTION tool-call))))))
-                   (fn-name (rest (assoc :NAME (rest (assoc :FUNCTION tool-call)))))
-                   (fn-tool (gethash fn-name *tools*)))
+                   (fn-name (rest (assoc :NAME (rest (assoc :FUNCTION tool-call))))))
               `((:role . "tool")
                 (:tool_call_id . ,(rest (assoc :id tool-call)))
-                (:content . ,(apply (slot-value fn-tool 'fn)
-                  (map-args-to-parameters fn-tool args))))))))
+                (:content . ,(invoke-tool fn-name args)))))))
     (completions-loop provider endpoint headers (append messages
                     (loop for tool-call in tool-calls
                     collect `(("role" . "assistant")
@@ -550,23 +558,215 @@
   (when streaming-callback
     (error "streaming-callback not currently supported with anthropic completer"))
 
-  (with-slots (endpoint api-key model) provider
-    (let ((content
-            (format nil "{
-\"model\": ~S,
-\"max_tokens\": ~A,
-\"messages\": ~A
-}"
-                    model
-                    max-tokens
-                    (json:encode-json-to-string (make-array (length messages) :initial-contents messages))))
-          (headers `(("x-api-key" . ,api-key)
-                     ("anthropic-version" . "2023-06-01"))))
-      (let ((response (json:decode-json-from-string
+  (with-slots (endpoint api-key model tools) provider
+    (let* ((system-text
+             (with-output-to-string (s)
+               (loop for msg in messages
+                     for role = (or (rest (assoc :role msg))
+                                    (cdr (assoc "role" msg :test #'string=)))
+                     for content = (or (rest (assoc :content msg))
+                                       (cdr (assoc "content" msg :test #'string=)))
+                     when (string= role "system")
+                     do (format s "~A " content))))
+           (non-system-messages
+             (loop for msg in messages
+                   for role = (or (rest (assoc :role msg))
+                                  (cdr (assoc "role" msg :test #'string=)))
+                   unless (string= role "system")
+                   collect msg))
+           (tools-rendered
+             (when tools
+               (loop for tool-symbol in tools
+                     collect (if-let ((tool (gethash (symbol-name tool-symbol) *tools*)))
+                               (render-anthropic tool)
+                               (error "Undefined tool function: ~A" tool-symbol)))))
+           (headers `(("x-api-key" . ,api-key)
+                      ("anthropic-version" . "2023-06-01")))
+           (api-messages non-system-messages))
+
+      ;; Loop to handle tool calls
+      (loop
+        for payload = `((:model . ,model)
+                        (:max_tokens . ,max-tokens)
+                        ,@(when (> (length system-text) 0)
+                            `(("system" . ,(string-trim " " system-text))))
+                        ,@(when tools-rendered
+                            `((:tools . ,(make-array (length tools-rendered)
+                                                     :initial-contents tools-rendered))))
+                        (:messages . ,(make-array (length api-messages)
+                                                  :initial-contents api-messages)))
+        for content = (json:encode-json-to-string payload)
+        do (when *debug-stream*
+             (format *debug-stream* "~&anthropic request: ~A~%" content))
+        for response = (json:decode-json-from-string
+                         (convert-byte-array-to-utf8
+                           (safe-http-request endpoint
+                                     :read-timeout *read-timeout*
+                                     :content content
+                                     :headers headers
+                                     :content-type "application/json"
+                                     :force-binary t
+                                     :want-stream nil)))
+        do (when *debug-stream*
+             (format *debug-stream* "~&anthropic response: ~A~%" response))
+        for content-blocks = (rest (assoc :content response))
+        for tool-use-blocks = (loop for block in content-blocks
+                                    when (string= (rest (assoc :type block)) "tool_use")
+                                    collect block)
+        while tool-use-blocks
+        do (let ((tool-results
+                   (loop for block in tool-use-blocks
+                         for tool-id = (rest (assoc :id block))
+                         for fn-name = (rest (assoc :name block))
+                         for fn-args = (rest (assoc :input block))
+                         collect `((:type . "tool_result")
+                                   ("tool_use_id" . ,tool-id)
+                                   (:content . ,(invoke-tool fn-name fn-args))))))
+             (setf api-messages
+                   (append api-messages
+                           (list `((:role . "assistant")
+                                   (:content . ,(make-array (length content-blocks)
+                                                            :initial-contents content-blocks))))
+                           (list `((:role . "user")
+                                   (:content . ,(make-array (length tool-results)
+                                                            :initial-contents tool-results)))))))
+        finally
+          (let ((text (rest (assoc :text
+                                   (find "text" content-blocks
+                                         :key (lambda (b) (rest (assoc :type b)))
+                                         :test #'string=)))))
+            (return (values text
+                            (append1 messages
+                                     `((:role . "assistant") (:content . ,text))))))))))
+
+(defmethod render-gemini ((tool function-tool))
+  "Render a function-tool as a Gemini functionDeclaration."
+  (with-slots (description name parameters) tool
+    `((:name . ,name)
+      (:description . ,description)
+      ,@(when parameters
+          `((:parameters . ((:type . "object")
+                            (:properties . ,(loop for p in parameters
+                                                  collect (list (first p)
+                                                                (cons :type (second p))
+                                                                (cons :description (third p)))))
+                            (:required . ,(loop for p in parameters
+                                                collect (first p))))))))))
+
+(defmethod render-anthropic ((tool function-tool))
+  "Render a function-tool as an Anthropic tool definition."
+  (with-slots (description name parameters) tool
+    (let ((schema (when parameters
+                    `(("type" . "object")
+                      ("properties" . ,(loop for p in parameters
+                                             collect (list (first p)
+                                                           (cons "type" (second p))
+                                                           (cons "description" (third p)))))
+                      ("required" . ,(make-array (length parameters)
+                                                 :initial-contents
+                                                 (loop for p in parameters
+                                                       collect (first p))))))))
+      `((:name . ,name)
+        (:description . ,description)
+        ,@(when schema
+            `(("input_schema" . ,schema)))))))
+
+(defun extract-system-instruction (messages)
+  "Extract system messages from MESSAGES and return a Gemini systemInstruction object, or nil."
+  (let ((system-texts
+          (loop for msg in messages
+                for role = (or (rest (assoc :role msg))
+                               (cdr (assoc "role" msg :test #'string=)))
+                for content = (or (rest (assoc :content msg))
+                                  (cdr (assoc "content" msg :test #'string=)))
+                when (string= role "system")
+                collect content)))
+    (when system-texts
+      `((:role . "user")
+        (:parts . (((:text . ,(format nil "~{~A~^ ~}" system-texts)))))))))
+
+(defun convert-messages-to-gemini (messages)
+  "Convert OpenAI-format messages to Gemini contents format, skipping system messages."
+  (loop for msg in messages
+        for role = (or (rest (assoc :role msg))
+                       (cdr (assoc "role" msg :test #'string=)))
+        for content = (or (rest (assoc :content msg))
+                          (cdr (assoc "content" msg :test #'string=)))
+        unless (string= role "system")
+        collect `((:role . ,(cond ((string= role "assistant") "model")
+                                  (t role)))
+                  (:parts . (((:text . ,content)))))))
+
+(defun gemini-make-payload (contents tools-rendered max-tokens &optional system-instruction)
+  "Build a Gemini API request payload."
+  `(,@(when system-instruction
+        `((:system-instruction . ,system-instruction)))
+    (:contents . ,(make-array (length contents) :initial-contents contents))
+    ,@(when tools-rendered
+        `((:tools . (((:function-declarations
+                       . ,(make-array (length tools-rendered)
+                                      :initial-contents tools-rendered)))))))
+    (:generation-config . ((:max-output-tokens . ,max-tokens)))))
+
+(defun gemini-call (endpoint payload headers)
+  "Make a Gemini API call and return the parsed response."
+  (let ((content (json:encode-json-to-string payload)))
+    (when *debug-stream*
+      (format *debug-stream* "~&gemini request: ~A~%" content))
+    (let ((response (json:decode-json-from-string
+                      (convert-byte-array-to-utf8
                         (safe-http-request endpoint
                                   :read-timeout *read-timeout*
                                   :content content
                                   :headers headers
-                                  :content-type "application/json"))))
-        (values (rest (assoc :text (second (assoc :content response))))
-                (append messages `(((:role . "assistant") ,(assoc :content response)))))))))
+                                  :force-binary t
+                                  :want-stream nil)))))
+      (when *debug-stream*
+        (format *debug-stream* "~&gemini response: ~A~%" response))
+      response)))
+
+(defmethod get-completion ((provider gemini-completer) messages &key (max-tokens 1024) (streaming-callback nil))
+  (when (stringp messages)
+    (setf messages `(((:role . "user") (:content . ,messages)))))
+
+  (when streaming-callback
+    (error "streaming-callback not currently supported with gemini completer"))
+
+  (with-slots (api-key model tools) provider
+    (let* ((endpoint (format nil "https://generativelanguage.googleapis.com/v1beta/models/~A:generateContent?key=~A"
+                             model api-key))
+           (tools-rendered
+             (when tools
+               (loop for tool-symbol in tools
+                     collect (if-let ((tool (gethash (symbol-name tool-symbol) *tools*)))
+                               (render-gemini tool)
+                               (error "Undefined tool function: ~A" tool-symbol)))))
+           (system-instruction (extract-system-instruction messages))
+           (contents (convert-messages-to-gemini messages))
+           (headers `(("Content-Type" . "application/json"))))
+
+      ;; Loop to handle tool calls
+      (loop
+        for payload = (gemini-make-payload contents tools-rendered max-tokens system-instruction)
+        for response = (gemini-call endpoint payload headers)
+        for candidate = (first (rest (assoc :candidates response)))
+        for parts = (rest (assoc :parts (rest (assoc :content candidate))))
+        for fn-calls = (loop for part in parts
+                             when (assoc :function-call part)
+                             collect (rest (assoc :function-call part)))
+        while fn-calls
+        do (let ((tool-results
+                   (loop for fn-call in fn-calls
+                         for fn-name = (rest (assoc :name fn-call))
+                         for fn-args = (rest (assoc :args fn-call))
+                         collect `((:function-response
+                                    . ((:name . ,fn-name)
+                                       (:response . ((:content . ,(invoke-tool fn-name fn-args))))))))))
+             (setf contents (append contents
+                                    (list `((:role . "model") (:parts . ,parts)))
+                                    (list `((:role . "user") (:parts . ,tool-results))))))
+        finally
+          (let ((text (rest (assoc :text (first parts)))))
+            (return (values text
+                            (append1 messages
+                                     `((:role . "assistant") (:content . ,text))))))))))

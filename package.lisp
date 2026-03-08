@@ -27,7 +27,7 @@
   (:use #:cl #:alexandria #:serapeum)
   (:documentation "A Common Lisp library for interacting with LLM completion APIs including OpenAI,
    Anthropic, and Ollama, with support for tool calling, streaming, and safety features.")
-  (:export completer openai-completer ollama-completer anthropic-completer get-completion defun-tool *read-timeout* *debug-stream*
+  (:export completer openai-completer ollama-completer anthropic-completer gemini-completer get-completion defun-tool *read-timeout* *debug-stream*
            ;; Permission and safety system
            *permission-callback* *default-safety-level* *safe-tools*
            ;; Tool classification

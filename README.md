@@ -9,7 +9,7 @@ Usage
 $ ocicl install completions
 ```
 
-`cl-completions` supports [ollama](https://ollama.com/), [OpenAI](https://openai.com/blog/openai-api), and [Anthropic](https://anthropic.com/api) APIs.
+`cl-completions` supports [ollama](https://ollama.com/), [OpenAI](https://openai.com/blog/openai-api), [Anthropic](https://anthropic.com/api), and [Google Gemini](https://ai.google.dev/) APIs.
 
 To use the ollama API:
 
@@ -29,6 +29,13 @@ To use the Anthropic API:
 
 ```
 (let ((completer (make-instance 'anthropic-completer :api-key (uiop:getenv "ANTHROPIC_API_KEY"))))
+  (get-completion completer "It's a beautiful day for " :max-tokens 100))
+```
+
+To use the Google Gemini API:
+
+```
+(let ((completer (make-instance 'gemini-completer :api-key (uiop:getenv "GEMINI_API_KEY") :model "gemini-2.0-flash")))
   (get-completion completer "It's a beautiful day for " :max-tokens 100))
 ```
 
@@ -160,16 +167,47 @@ The library provides functions for discovering and inspecting available tools:
 
 ### Using Tools with Completers
 
+Tools work with OpenAI, Anthropic, and Gemini completers:
+
 ```lisp
+;; OpenAI
 (let ((c (make-instance 'openai-completer
                         :api-key (uiop:getenv "OPENAI_API_KEY")
                         :tools '(time-of-day get-temperature create-file))))
   (get-completion c "I'm in Toronto. What's the time and temperature here?" 20))
+
+;; Anthropic
+(let ((c (make-instance 'anthropic-completer
+                        :api-key (uiop:getenv "ANTHROPIC_API_KEY")
+                        :tools '(time-of-day get-temperature))))
+  (get-completion c "I'm in Toronto. What's the time and temperature here?" :max-tokens 200))
+
+;; Gemini
+(let ((c (make-instance 'gemini-completer
+                        :api-key (uiop:getenv "GEMINI_API_KEY")
+                        :tools '(time-of-day get-temperature))))
+  (get-completion c "I'm in Toronto. What's the time and temperature here?" :max-tokens 200))
 ```
 
 This generates output like:
 ```
 The current time in Toronto is 20:01:22 and it's cold there right now
+```
+
+### System Messages
+
+System messages (role `"system"`) are automatically handled for all providers:
+
+- **OpenAI / Ollama**: Passed directly in the messages array (native support).
+- **Anthropic**: Extracted and sent as the top-level `system` field in the API request.
+- **Gemini**: Extracted and sent as the `systemInstruction` field in the API request.
+
+```lisp
+(let ((c (make-instance 'anthropic-completer
+                        :api-key (uiop:getenv "ANTHROPIC_API_KEY")))
+      (messages '(((:role . "system") (:content . "You are a helpful pirate. Speak like a pirate."))
+                  ((:role . "user") (:content . "What is Common Lisp?")))))
+  (get-completion c messages :max-tokens 200))
 ```
 
 The default read timeout for a response from the completer is 120
