@@ -167,7 +167,7 @@ The library provides functions for discovering and inspecting available tools:
 
 ### Using Tools with Completers
 
-Tools work with OpenAI, Anthropic, and Gemini completers:
+Tools work with OpenAI, Anthropic, Gemini, and Ollama completers:
 
 ```lisp
 ;; OpenAI
@@ -185,6 +185,12 @@ Tools work with OpenAI, Anthropic, and Gemini completers:
 ;; Gemini
 (let ((c (make-instance 'gemini-completer
                         :api-key (uiop:getenv "GEMINI_API_KEY")
+                        :tools '(time-of-day get-temperature))))
+  (get-completion c "I'm in Toronto. What's the time and temperature here?" :max-tokens 200))
+
+;; Ollama (tools require non-streaming mode)
+(let ((c (make-instance 'ollama-completer
+                        :model "llama3.1:latest"
                         :tools '(time-of-day get-temperature))))
   (get-completion c "I'm in Toronto. What's the time and temperature here?" :max-tokens 200))
 ```
@@ -210,10 +216,46 @@ System messages (role `"system"`) are automatically handled for all providers:
   (get-completion c messages :max-tokens 200))
 ```
 
+### Streaming
+
+All four providers support streaming via the `:streaming-callback` keyword. The callback receives text chunks as they arrive:
+
+```lisp
+(get-completion completer "Tell me a story"
+                :max-tokens 200
+                :streaming-callback (lambda (text) (princ text)))
+```
+
+**Note:** Streaming cannot be combined with tool calling. If both `:streaming-callback` and `:tools` are provided, an error is signaled.
+
+### Structured Output (response-format)
+
+OpenAI, Anthropic, and Gemini support structured output via the `:response-format` keyword:
+
+```lisp
+;; OpenAI / Anthropic
+(get-completion completer messages :response-format "json_object")
+
+;; Gemini (json_object maps to application/json MIME type)
+(get-completion completer messages :response-format "json_object")
+```
+
+### Error Handling
+
+Tool invocation errors are caught and returned as `"Error: ..."` strings to the LLM, allowing it to see the error and recover rather than crashing the completion loop. This applies to unknown tools and tools that signal errors during execution.
+
 The default read timeout for a response from the completer is 120
 seconds.  You can modify this by setting `completions:*read-timeout*`
 to a new value.
 
+## Testing
+
+The library includes a test suite using [FiveAM](https://github.com/sionescu/fiveam):
+
+```lisp
+(asdf:load-system "completions/tests")
+(fiveam:run! 'completions/tests::completions-suite)
+```
 
 Related Projects
 -----------------

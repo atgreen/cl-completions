@@ -77,13 +77,14 @@
 (defclass anthropic-completer (completer)
   ((endpoint :initform "https://api.anthropic.com/v1/messages" :initarg :endpoint)
    (api-key :initarg :api-key)
-   (model :initarg :model :initform "claude-3-opus-20240229")
+   (model :initarg :model :initform "claude-sonnet-4-20250514")
    (tools :initarg :tools :initform (list)))
   (:documentation "Anthropic Claude completion provider supporting chat messages."))
 
 (defclass ollama-completer (completer)
   ((endpoint :initform "http://localhost:11434/api/chat" :initarg :endpoint)
-   (model :initarg :model))
+   (model :initarg :model)
+   (tools :initarg :tools :initform (list)))
   (:documentation "Ollama completion provider for local LLM inference."))
 
 (defclass gemini-completer (completer)
@@ -225,10 +226,13 @@
         collect (rest (assoc (intern (string-upcase param-name) :keyword) args))))
 
 (defun invoke-tool (fn-name args)
-  "Look up tool FN-NAME, call it with ARGS (a decoded alist), return result."
-  (let ((fn-tool (gethash fn-name *tools*)))
-    (unless fn-tool (error "Unknown tool: ~A" fn-name))
-    (apply (slot-value fn-tool 'fn) (map-args-to-parameters fn-tool args))))
+  "Look up tool FN-NAME, call it with ARGS (a decoded alist), return result string.
+Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recover."
+  (handler-case
+      (let ((fn-tool (gethash fn-name *tools*)))
+        (unless fn-tool (return-from invoke-tool (format nil "Error: Unknown tool: ~A" fn-name)))
+        (apply (slot-value fn-tool 'fn) (map-args-to-parameters fn-tool args)))
+    (error (e) (format nil "Error: ~A" e))))
 
 (defun execute-tool (tool-name args body-fn)
   "Execute a tool with permission checks, context binding, hooks, etc."
@@ -510,26 +514,35 @@
 
 
 (defmethod get-completion ((provider ollama-completer) messages &key (max-tokens 1024) (streaming-callback nil) (response-format nil))
-  ;; Fixme: max-tokens is ignored
   (when (stringp messages)
     (setf messages `(((:role . "user") (:content . ,messages)))))
 
-  (with-slots (endpoint model) provider
-    (let ((content
-            (format nil "{ \"model\": ~S, \"stream\": ~A, ~A \"messages\": ~A }"
-                    model
-                    (if streaming-callback "true" "false")
-                    (if response-format (format nil "\"format\": ~S," response-format) "")
-                    (json:encode-json-to-string (make-array (length messages) :initial-contents messages))))
-          (headers `(("Content-Type" . "application/json"))))
+  (with-slots (endpoint model tools) provider
+
+    (when (and streaming-callback tools)
+      (error "streaming-callback and tools cannot be used together with ollama completer"))
+    (let* ((tools-rendered
+             (when tools
+               (loop for tool-symbol in tools
+                     collect (if-let ((tool (gethash (symbol-name tool-symbol) *tools*)))
+                               (render tool)
+                               (error "Undefined tool function: ~A" tool-symbol)))))
+           (headers `(("Content-Type" . "application/json"))))
 
       (if streaming-callback
 
-          (let ((response-stream (safe-http-request endpoint
-                                           :read-timeout *read-timeout*
-                                           :content content
-                                           :headers headers
-                                           :want-stream t)))
+          ;; Streaming (no tools)
+          (let* ((content
+                   (json:encode-json-to-string
+                     `((:model . ,model) (:stream . t)
+                       ,@(when response-format `((:format . ,response-format)))
+                       (:options . ((:num_predict . ,max-tokens)))
+                       (:messages . ,(make-array (length messages) :initial-contents messages)))))
+                 (response-stream (safe-http-request endpoint
+                                            :read-timeout *read-timeout*
+                                            :content content
+                                            :headers headers
+                                            :want-stream t)))
             (let ((response
                     (unwind-protect
                          (with-output-to-string (sstream)
@@ -540,25 +553,80 @@
                                   (format sstream "~A" (rest (assoc :CONTENT (rest (assoc :MESSAGE json-object)))))
                                   (funcall streaming-callback (rest (assoc :CONTENT (rest (assoc :MESSAGE json-object))))))))
                       (close response-stream))))
-                  (values response
-                          (append1 messages `((:ROLE . "assistant") (:CONTENT . ,response))))))
+              (values response
+                      (append1 messages `((:ROLE . "assistant") (:CONTENT . ,response))))))
 
-          (let ((response (json:decode-json-from-string
-                            (safe-http-request endpoint
-                                      :read-timeout *read-timeout*
-                                      :content content
-                                      :headers headers))))
-            (values (rest (assoc :content (rest (assoc :message response))))
-                (append1 messages (rest (assoc :message response)))))))))
+          ;; Non-streaming (with optional tool-calling loop)
+          (let ((api-messages messages))
+            (loop
+              for content = (json:encode-json-to-string
+                              `((:model . ,model) (:stream . :false)
+                                ,@(when response-format `((:format . ,response-format)))
+                                (:options . ((:num_predict . ,max-tokens)))
+                                ,@(when tools-rendered
+                                    `((:tools . ,(make-array (length tools-rendered)
+                                                             :initial-contents tools-rendered))))
+                                (:messages . ,(make-array (length api-messages)
+                                                          :initial-contents api-messages))))
+              do (when *debug-stream*
+                   (format *debug-stream* "~&ollama request: ~A~%" content))
+              for response = (json:decode-json-from-string
+                               (safe-http-request endpoint
+                                         :read-timeout *read-timeout*
+                                         :content content
+                                         :headers headers))
+              do (when *debug-stream*
+                   (format *debug-stream* "~&ollama response: ~A~%" response))
+              for message = (rest (assoc :message response))
+              for tool-calls = (rest (assoc :tool--calls message))
+              while tool-calls
+              do (let ((tool-results
+                         (loop for tc in tool-calls
+                               for func = (rest (assoc :function tc))
+                               for fn-name = (rest (assoc :name func))
+                               for raw-args = (rest (assoc :arguments func))
+                               for fn-args = (if (stringp raw-args)
+                                                  (json:decode-json-from-string raw-args)
+                                                  raw-args)
+                               collect `((:role . "tool")
+                                         (:content . ,(invoke-tool fn-name fn-args))))))
+                   (setf api-messages
+                         (append api-messages
+                                 (list message)
+                                 tool-results)))
+              finally
+                (let ((text (rest (assoc :content message))))
+                  (return (values text
+                                  (append1 messages
+                                           `((:role . "assistant") (:content . ,text))))))))))))
 
-(defmethod get-completion ((provider anthropic-completer) messages &key (max-tokens 1024) (streaming-callback nil))
+(defun read-anthropic-sse-stream (stream streaming-callback)
+  "Read Anthropic SSE events from STREAM, call STREAMING-CALLBACK for text deltas, return accumulated text."
+  (with-output-to-string (acc)
+    (loop for line = (read-line stream nil 'eof)
+          until (eq line 'eof)
+          do (when *debug-stream*
+               (format *debug-stream* "~&anthropic sse: ~A~%" line))
+          when (and (> (length line) 6) (string= "data: " (subseq line 0 6)))
+          do (let* ((json (ignore-errors (json:decode-json-from-string (subseq line 6))))
+                    (type (rest (assoc :type json))))
+               (when (and type (string= type "content_block_delta"))
+                 (let* ((delta (rest (assoc :delta json)))
+                        (delta-type (rest (assoc :type delta))))
+                   (when (string= delta-type "text_delta")
+                     (let ((text (rest (assoc :text delta))))
+                       (when text
+                         (write-string text acc)
+                         (funcall streaming-callback text))))))))))
+
+(defmethod get-completion ((provider anthropic-completer) messages &key (max-tokens 1024) (streaming-callback nil) (response-format nil))
   (when (stringp messages)
     (setf messages `(((:role . "user") (:content . ,messages)))))
 
-  (when streaming-callback
-    (error "streaming-callback not currently supported with anthropic completer"))
-
   (with-slots (endpoint api-key model tools) provider
+
+    (when (and streaming-callback tools)
+      (error "streaming-callback and tools cannot be used together with anthropic completer"))
     (let* ((system-text
              (with-output-to-string (s)
                (loop for msg in messages
@@ -581,63 +649,95 @@
                                (render-anthropic tool)
                                (error "Undefined tool function: ~A" tool-symbol)))))
            (headers `(("x-api-key" . ,api-key)
-                      ("anthropic-version" . "2023-06-01")))
+                      ("anthropic-version" . "2023-06-01")
+                      ,@(when response-format
+                          `(("anthropic-beta" . "structured-outputs-2025-11-13")))))
            (api-messages non-system-messages))
 
-      ;; Loop to handle tool calls
-      (loop
-        for payload = `((:model . ,model)
-                        (:max_tokens . ,max-tokens)
-                        ,@(when (> (length system-text) 0)
-                            `(("system" . ,(string-trim " " system-text))))
-                        ,@(when tools-rendered
-                            `((:tools . ,(make-array (length tools-rendered)
-                                                     :initial-contents tools-rendered))))
-                        (:messages . ,(make-array (length api-messages)
-                                                  :initial-contents api-messages)))
-        for content = (json:encode-json-to-string payload)
-        do (when *debug-stream*
-             (format *debug-stream* "~&anthropic request: ~A~%" content))
-        for response = (json:decode-json-from-string
-                         (convert-byte-array-to-utf8
-                           (safe-http-request endpoint
-                                     :read-timeout *read-timeout*
-                                     :content content
-                                     :headers headers
-                                     :content-type "application/json"
-                                     :force-binary t
-                                     :want-stream nil)))
-        do (when *debug-stream*
-             (format *debug-stream* "~&anthropic response: ~A~%" response))
-        for content-blocks = (rest (assoc :content response))
-        for tool-use-blocks = (loop for block in content-blocks
-                                    when (string= (rest (assoc :type block)) "tool_use")
-                                    collect block)
-        while tool-use-blocks
-        do (let ((tool-results
-                   (loop for block in tool-use-blocks
-                         for tool-id = (rest (assoc :id block))
-                         for fn-name = (rest (assoc :name block))
-                         for fn-args = (rest (assoc :input block))
-                         collect `((:type . "tool_result")
-                                   ("tool_use_id" . ,tool-id)
-                                   (:content . ,(invoke-tool fn-name fn-args))))))
-             (setf api-messages
-                   (append api-messages
-                           (list `((:role . "assistant")
-                                   (:content . ,(make-array (length content-blocks)
-                                                            :initial-contents content-blocks))))
-                           (list `((:role . "user")
-                                   (:content . ,(make-array (length tool-results)
-                                                            :initial-contents tool-results)))))))
-        finally
-          (let ((text (rest (assoc :text
-                                   (find "text" content-blocks
-                                         :key (lambda (b) (rest (assoc :type b)))
-                                         :test #'string=)))))
-            (return (values text
-                            (append1 messages
-                                     `((:role . "assistant") (:content . ,text))))))))))
+      (if streaming-callback
+
+          ;; Streaming path (no tools)
+          (let* ((payload `((:model . ,model)
+                            (:max_tokens . ,max-tokens)
+                            (:stream . t)
+                            ,@(when (> (length system-text) 0)
+                                `(("system" . ,(string-trim " " system-text))))
+                            ,@(when response-format
+                                `((:output_format . ((:type . ,response-format)))))
+                            (:messages . ,(make-array (length api-messages)
+                                                      :initial-contents api-messages))))
+                 (content (json:encode-json-to-string payload)))
+            (when *debug-stream*
+              (format *debug-stream* "~&anthropic streaming request: ~A~%" content))
+            (let ((response-stream (safe-http-request endpoint
+                                              :read-timeout *read-timeout*
+                                              :content content
+                                              :headers headers
+                                              :content-type "application/json"
+                                              :want-stream t)))
+              (unwind-protect
+                   (let ((text (read-anthropic-sse-stream response-stream streaming-callback)))
+                     (values text
+                             (append1 messages
+                                      `((:role . "assistant") (:content . ,text)))))
+                (close response-stream))))
+
+          ;; Non-streaming tool-calling loop
+          (loop
+            for payload = `((:model . ,model)
+                            (:max_tokens . ,max-tokens)
+                            ,@(when (> (length system-text) 0)
+                                `(("system" . ,(string-trim " " system-text))))
+                            ,@(when response-format
+                                `((:output_format . ((:type . ,response-format)))))
+                            ,@(when tools-rendered
+                                `((:tools . ,(make-array (length tools-rendered)
+                                                         :initial-contents tools-rendered))))
+                            (:messages . ,(make-array (length api-messages)
+                                                      :initial-contents api-messages)))
+            for content = (json:encode-json-to-string payload)
+            do (when *debug-stream*
+                 (format *debug-stream* "~&anthropic request: ~A~%" content))
+            for response = (json:decode-json-from-string
+                             (convert-byte-array-to-utf8
+                               (safe-http-request endpoint
+                                         :read-timeout *read-timeout*
+                                         :content content
+                                         :headers headers
+                                         :content-type "application/json"
+                                         :force-binary t
+                                         :want-stream nil)))
+            do (when *debug-stream*
+                 (format *debug-stream* "~&anthropic response: ~A~%" response))
+            for content-blocks = (rest (assoc :content response))
+            for tool-use-blocks = (loop for block in content-blocks
+                                        when (string= (rest (assoc :type block)) "tool_use")
+                                        collect block)
+            while tool-use-blocks
+            do (let ((tool-results
+                       (loop for block in tool-use-blocks
+                             for tool-id = (rest (assoc :id block))
+                             for fn-name = (rest (assoc :name block))
+                             for fn-args = (rest (assoc :input block))
+                             collect `((:type . "tool_result")
+                                       ("tool_use_id" . ,tool-id)
+                                       (:content . ,(invoke-tool fn-name fn-args))))))
+                 (setf api-messages
+                       (append api-messages
+                               (list `((:role . "assistant")
+                                       (:content . ,(make-array (length content-blocks)
+                                                                :initial-contents content-blocks))))
+                               (list `((:role . "user")
+                                       (:content . ,(make-array (length tool-results)
+                                                                :initial-contents tool-results)))))))
+            finally
+              (let ((text (rest (assoc :text
+                                       (find "text" content-blocks
+                                             :key (lambda (b) (rest (assoc :type b)))
+                                             :test #'string=)))))
+                (return (values text
+                                (append1 messages
+                                         `((:role . "assistant") (:content . ,text)))))))))))
 
 (defmethod render-gemini ((tool function-tool))
   "Render a function-tool as a Gemini functionDeclaration."
@@ -697,7 +797,7 @@
                                   (t role)))
                   (:parts . (((:text . ,content)))))))
 
-(defun gemini-make-payload (contents tools-rendered max-tokens &optional system-instruction)
+(defun gemini-make-payload (contents tools-rendered max-tokens &optional system-instruction response-format)
   "Build a Gemini API request payload."
   `(,@(when system-instruction
         `((:system-instruction . ,system-instruction)))
@@ -706,7 +806,9 @@
         `((:tools . (((:function-declarations
                        . ,(make-array (length tools-rendered)
                                       :initial-contents tools-rendered)))))))
-    (:generation-config . ((:max-output-tokens . ,max-tokens)))))
+    (:generation-config . ((:max-output-tokens . ,max-tokens)
+                           ,@(when (and response-format (string= response-format "json_object"))
+                               `((:response-mime-type . "application/json")))))))
 
 (defun gemini-call (endpoint payload headers)
   "Make a Gemini API call and return the parsed response."
@@ -725,16 +827,34 @@
         (format *debug-stream* "~&gemini response: ~A~%" response))
       response)))
 
-(defmethod get-completion ((provider gemini-completer) messages &key (max-tokens 1024) (streaming-callback nil))
+(defun read-gemini-sse-stream (stream streaming-callback)
+  "Read Gemini SSE events from STREAM, call STREAMING-CALLBACK for text chunks, return accumulated text."
+  (with-output-to-string (acc)
+    (loop for line = (read-line stream nil 'eof)
+          until (eq line 'eof)
+          do (when *debug-stream*
+               (format *debug-stream* "~&gemini sse: ~A~%" line))
+          when (and (> (length line) 6) (string= "data: " (subseq line 0 6)))
+          do (let* ((json (ignore-errors (json:decode-json-from-string (subseq line 6))))
+                    (candidates (rest (assoc :candidates json)))
+                    (parts (rest (assoc :parts (rest (assoc :content (first candidates))))))
+                    (text (rest (assoc :text (first parts)))))
+               (when text
+                 (write-string text acc)
+                 (funcall streaming-callback text))))))
+
+(defmethod get-completion ((provider gemini-completer) messages &key (max-tokens 1024) (streaming-callback nil) (response-format nil))
   (when (stringp messages)
     (setf messages `(((:role . "user") (:content . ,messages)))))
 
-  (when streaming-callback
-    (error "streaming-callback not currently supported with gemini completer"))
-
   (with-slots (api-key model tools) provider
-    (let* ((endpoint (format nil "https://generativelanguage.googleapis.com/v1beta/models/~A:generateContent?key=~A"
-                             model api-key))
+
+    (when (and streaming-callback tools)
+      (error "streaming-callback and tools cannot be used together with gemini completer"))
+    (let* ((endpoint (format nil "https://generativelanguage.googleapis.com/v1beta/models/~A:~A~A"
+                             model
+                             (if streaming-callback "streamGenerateContent?alt=sse&key=" "generateContent?key=")
+                             api-key))
            (tools-rendered
              (when tools
                (loop for tool-symbol in tools
@@ -745,28 +865,47 @@
            (contents (convert-messages-to-gemini messages))
            (headers `(("Content-Type" . "application/json"))))
 
-      ;; Loop to handle tool calls
-      (loop
-        for payload = (gemini-make-payload contents tools-rendered max-tokens system-instruction)
-        for response = (gemini-call endpoint payload headers)
-        for candidate = (first (rest (assoc :candidates response)))
-        for parts = (rest (assoc :parts (rest (assoc :content candidate))))
-        for fn-calls = (loop for part in parts
-                             when (assoc :function-call part)
-                             collect (rest (assoc :function-call part)))
-        while fn-calls
-        do (let ((tool-results
-                   (loop for fn-call in fn-calls
-                         for fn-name = (rest (assoc :name fn-call))
-                         for fn-args = (rest (assoc :args fn-call))
-                         collect `((:function-response
-                                    . ((:name . ,fn-name)
-                                       (:response . ((:content . ,(invoke-tool fn-name fn-args))))))))))
-             (setf contents (append contents
-                                    (list `((:role . "model") (:parts . ,parts)))
-                                    (list `((:role . "user") (:parts . ,tool-results))))))
-        finally
-          (let ((text (rest (assoc :text (first parts)))))
-            (return (values text
-                            (append1 messages
-                                     `((:role . "assistant") (:content . ,text))))))))))
+      (if streaming-callback
+
+          ;; Streaming path (no tools)
+          (let* ((payload (gemini-make-payload contents nil max-tokens system-instruction response-format))
+                 (content (json:encode-json-to-string payload)))
+            (when *debug-stream*
+              (format *debug-stream* "~&gemini streaming request: ~A~%" content))
+            (let ((response-stream (safe-http-request endpoint
+                                              :read-timeout *read-timeout*
+                                              :content content
+                                              :headers headers
+                                              :want-stream t)))
+              (unwind-protect
+                   (let ((text (read-gemini-sse-stream response-stream streaming-callback)))
+                     (values text
+                             (append1 messages
+                                      `((:role . "assistant") (:content . ,text)))))
+                (close response-stream))))
+
+          ;; Non-streaming tool-calling loop
+          (loop
+            for payload = (gemini-make-payload contents tools-rendered max-tokens system-instruction response-format)
+            for response = (gemini-call endpoint payload headers)
+            for candidate = (first (rest (assoc :candidates response)))
+            for parts = (rest (assoc :parts (rest (assoc :content candidate))))
+            for fn-calls = (loop for part in parts
+                                 when (assoc :function-call part)
+                                 collect (rest (assoc :function-call part)))
+            while fn-calls
+            do (let ((tool-results
+                       (loop for fn-call in fn-calls
+                             for fn-name = (rest (assoc :name fn-call))
+                             for fn-args = (rest (assoc :args fn-call))
+                             collect `((:function-response
+                                        . ((:name . ,fn-name)
+                                           (:response . ((:content . ,(invoke-tool fn-name fn-args))))))))))
+                 (setf contents (append contents
+                                        (list `((:role . "model") (:parts . ,parts)))
+                                        (list `((:role . "user") (:parts . ,tool-results))))))
+            finally
+              (let ((text (rest (assoc :text (first parts)))))
+                (return (values text
+                                (append1 messages
+                                         `((:role . "assistant") (:content . ,text)))))))))))

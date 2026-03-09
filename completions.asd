@@ -32,3 +32,8 @@
   :components ((:file "package")
                (:file "completions"))
   :depends-on (:dexador :cl-json :flexi-streams :babel :str :alexandria :serapeum))
+
+(asdf:defsystem "completions/tests"
+  :description "Tests for the completions library"
+  :depends-on ("completions" :fiveam)
+  :components ((:file "tests")))
