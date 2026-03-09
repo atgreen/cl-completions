@@ -851,13 +851,12 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
     (setf messages `(((:role . "user") (:content . ,messages)))))
 
   (with-slots (api-key model tools) provider
-
-    (when (and streaming-callback tools)
-      (error "streaming-callback and tools cannot be used together with gemini completer"))
-    (let* ((endpoint (format nil "https://generativelanguage.googleapis.com/v1beta/models/~A:~A~A"
-                             model
-                             (if streaming-callback "streamGenerateContent?alt=sse&key=" "generateContent?key=")
-                             api-key))
+    (let* ((non-streaming-endpoint
+             (format nil "https://generativelanguage.googleapis.com/v1beta/models/~A:generateContent?key=~A"
+                     model api-key))
+           (streaming-endpoint
+             (format nil "https://generativelanguage.googleapis.com/v1beta/models/~A:streamGenerateContent?alt=sse&key=~A"
+                     model api-key))
            (tools-rendered
              (when tools
                (loop for tool-symbol in tools
@@ -868,46 +867,45 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
            (contents (convert-messages-to-gemini messages))
            (headers `(("Content-Type" . "application/json"))))
 
-      (if streaming-callback
-
-          ;; Streaming path (no tools)
-          (let* ((payload (gemini-make-payload contents nil max-tokens system-instruction response-format))
-                 (content (json:encode-json-to-string payload)))
-            (when *debug-stream*
-              (format *debug-stream* "~&gemini streaming request: ~A~%" content))
-            (let ((response-stream (safe-http-request endpoint
-                                              :read-timeout *read-timeout*
-                                              :content content
-                                              :headers headers
-                                              :want-stream t)))
-              (unwind-protect
-                   (let ((text (read-gemini-sse-stream response-stream streaming-callback)))
-                     (values text
-                             (append1 messages
-                                      `((:role . "assistant") (:content . ,text)))))
-                (close response-stream))))
-
-          ;; Non-streaming tool-calling loop
-          (loop
-            for payload = (gemini-make-payload contents tools-rendered max-tokens system-instruction response-format)
-            for response = (gemini-call endpoint payload headers)
-            for candidate = (first (rest (assoc :candidates response)))
-            for parts = (rest (assoc :parts (rest (assoc :content candidate))))
-            for fn-calls = (loop for part in parts
-                                 when (assoc :function-call part)
-                                 collect (rest (assoc :function-call part)))
-            while fn-calls
-            do (let ((tool-results
-                       (loop for fn-call in fn-calls
-                             for fn-name = (rest (assoc :name fn-call))
-                             for fn-args = (rest (assoc :args fn-call))
-                             collect `((:function-response
-                                        . ((:name . ,fn-name)
-                                           (:response . ((:content . ,(invoke-tool fn-name fn-args))))))))))
-                 (setf contents (append contents
-                                        (list `((:role . "model") (:parts . ,parts)))
-                                        (list `((:role . "user") (:parts . ,tool-results))))))
-            finally
+      ;; Tool-calling loop (non-streaming rounds), then final response
+      (loop
+        for payload = (gemini-make-payload contents tools-rendered max-tokens system-instruction response-format)
+        for response = (gemini-call non-streaming-endpoint payload headers)
+        for candidate = (first (rest (assoc :candidates response)))
+        for parts = (rest (assoc :parts (rest (assoc :content candidate))))
+        for fn-calls = (loop for part in parts
+                             when (assoc :function-call part)
+                             collect (rest (assoc :function-call part)))
+        while fn-calls
+        do (let ((tool-results
+                   (loop for fn-call in fn-calls
+                         for fn-name = (rest (assoc :name fn-call))
+                         for fn-args = (rest (assoc :args fn-call))
+                         collect `((:function-response
+                                    . ((:name . ,fn-name)
+                                       (:response . ((:content . ,(invoke-tool fn-name fn-args))))))))))
+             (setf contents (append contents
+                                    (list `((:role . "model") (:parts . ,parts)))
+                                    (list `((:role . "user") (:parts . ,tool-results))))))
+        finally
+          (if streaming-callback
+              ;; Stream the final text response
+              (let* ((stream-payload (gemini-make-payload contents nil max-tokens system-instruction response-format))
+                     (stream-content (json:encode-json-to-string stream-payload)))
+                (when *debug-stream*
+                  (format *debug-stream* "~&gemini streaming request: ~A~%" stream-content))
+                (let ((response-stream (safe-http-request streaming-endpoint
+                                                :read-timeout *read-timeout*
+                                                :content stream-content
+                                                :headers headers
+                                                :want-stream t)))
+                  (unwind-protect
+                       (let ((text (read-gemini-sse-stream response-stream streaming-callback)))
+                         (return (values text
+                                         (append1 messages
+                                                  `((:role . "assistant") (:content . ,text))))))
+                    (close response-stream))))
+              ;; Return the already-fetched non-streaming response
               (let ((text (rest (assoc :text (first parts)))))
                 (return (values text
                                 (append1 messages

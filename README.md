@@ -226,7 +226,7 @@ All four providers support streaming via the `:streaming-callback` keyword. The 
                 :streaming-callback (lambda (text) (princ text)))
 ```
 
-**Note:** Streaming cannot be combined with tool calling. If both `:streaming-callback` and `:tools` are provided, an error is signaled.
+**Note:** OpenAI and Gemini support streaming with tools (tool calls use non-streaming rounds, then the final response is streamed). Anthropic and Ollama do not currently support combining streaming with tools.
 
 ### Structured Output (response-format)
 
