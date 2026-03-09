@@ -383,13 +383,16 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                                           (concatenate 'string
                                                       (getf (gethash id tool-call-map) :arguments)
                                                       args)))))))))))
-    ;; Convert to list of complete tool-calls
+    ;; Convert to list of complete tool-calls (merge accumulated arguments)
     (loop for id being the hash-keys of tool-call-map
           for call-data = (gethash id tool-call-map)
           when (and (getf call-data :function)
                    (not (string= (getf call-data :arguments) "")))
-          collect (list (cons :id id)
-                       (cons :function (getf call-data :function))))))
+          collect (let ((func-name (rest (assoc :NAME (getf call-data :function)))))
+                    (list (cons :id id)
+                          (cons :function
+                                (list (cons :NAME func-name)
+                                      (cons :ARGUMENTS (getf call-data :arguments)))))))))
 
 (defun convert-byte-array-to-utf8 (byte-array)
   "Convert a byte array to a UTF-8 string, trying multiple encodings if necessary."
@@ -452,7 +455,7 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                               payload-format-string streaming-callback))
           (let ((response (with-output-to-string (s)
                             (loop for obj in objs
-                                  do (when-let ((content (rest (assoc :content (second (assoc :delta (assoc :choices obj)))))))
+                                  do (when-let ((content (rest (assoc :content (rest (assoc :delta (second (assoc :choices obj))))))))
                                        (princ content s))))))
             (values response
                     (append1 messages
