@@ -51,6 +51,12 @@
 (defvar *tool-context-vars* nil
   "List of dynamic variables to capture during tool execution")
 
+;; Tool interceptor for delegation
+(defvar *tool-interceptor* nil
+  "When non-nil, called as (funcall *tool-interceptor* tool-name args).
+If it returns a non-nil string, that string is used as the tool result.
+If it returns nil, normal tool execution proceeds.")
+
 ;; Event hooks
 (defvar *tool-start-hooks* nil
   "List of functions to call when a tool starts executing")
@@ -68,8 +74,8 @@
 (defclass openai-completer (completer)
   ((endpoint :initform "https://api.openai.com/v1/chat/completions" :initarg :endpoint)
    (api-key :initarg :api-key)
-   (prompt-token-count :initform 0)
-   (completion-token-count :initform 0)
+   (prompt-token-count :initform 0 :accessor prompt-token-count)
+   (completion-token-count :initform 0 :accessor completion-token-count)
    (model :initarg :model :initform "gpt-4")
    (tools :initarg :tools :initform (list)))
   (:documentation "OpenAI completion provider supporting chat completions and tool calls."))
@@ -77,21 +83,51 @@
 (defclass anthropic-completer (completer)
   ((endpoint :initform "https://api.anthropic.com/v1/messages" :initarg :endpoint)
    (api-key :initarg :api-key)
+   (prompt-token-count :initform 0 :accessor prompt-token-count)
+   (completion-token-count :initform 0 :accessor completion-token-count)
    (model :initarg :model :initform "claude-sonnet-4-20250514")
    (tools :initarg :tools :initform (list)))
   (:documentation "Anthropic Claude completion provider supporting chat messages."))
 
 (defclass ollama-completer (completer)
   ((endpoint :initform "http://localhost:11434/api/chat" :initarg :endpoint)
+   (prompt-token-count :initform 0 :accessor prompt-token-count)
+   (completion-token-count :initform 0 :accessor completion-token-count)
    (model :initarg :model)
    (tools :initarg :tools :initform (list)))
   (:documentation "Ollama completion provider for local LLM inference."))
 
 (defclass gemini-completer (completer)
   ((api-key :initarg :api-key)
+   (prompt-token-count :initform 0 :accessor prompt-token-count)
+   (completion-token-count :initform 0 :accessor completion-token-count)
    (model :initarg :model :initform "gemini-2.0-flash")
    (tools :initarg :tools :initform (list)))
   (:documentation "Google Gemini completion provider."))
+
+(defgeneric total-tokens-used (completer)
+  (:documentation "Return the total tokens used (prompt + completion) by this completer."))
+
+(defmethod total-tokens-used ((c openai-completer))
+  (+ (prompt-token-count c) (completion-token-count c)))
+(defmethod total-tokens-used ((c anthropic-completer))
+  (+ (prompt-token-count c) (completion-token-count c)))
+(defmethod total-tokens-used ((c ollama-completer))
+  (+ (prompt-token-count c) (completion-token-count c)))
+(defmethod total-tokens-used ((c gemini-completer))
+  (+ (prompt-token-count c) (completion-token-count c)))
+
+(defgeneric reset-token-counts (completer)
+  (:documentation "Reset the token counters to zero."))
+
+(defmethod reset-token-counts ((c openai-completer))
+  (setf (prompt-token-count c) 0 (completion-token-count c) 0))
+(defmethod reset-token-counts ((c anthropic-completer))
+  (setf (prompt-token-count c) 0 (completion-token-count c) 0))
+(defmethod reset-token-counts ((c ollama-completer))
+  (setf (prompt-token-count c) 0 (completion-token-count c) 0))
+(defmethod reset-token-counts ((c gemini-completer))
+  (setf (prompt-token-count c) 0 (completion-token-count c) 0))
 
 (defclass tool ()
   ()
@@ -231,7 +267,14 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
   (handler-case
       (let ((fn-tool (gethash fn-name *tools*)))
         (unless fn-tool (return-from invoke-tool (format nil "Error: Unknown tool: ~A" fn-name)))
-        (apply (slot-value fn-tool 'fn) (map-args-to-parameters fn-tool args)))
+        ;; Check interceptor first (for client-side tool delegation)
+        (when *tool-interceptor*
+          (let ((result (funcall *tool-interceptor* fn-name args)))
+            (when result (return-from invoke-tool result))))
+        ;; Normal execution
+        (let ((fn (slot-value fn-tool 'fn)))
+          (unless fn (return-from invoke-tool (format nil "Error: Tool ~A has no function (nil fn slot)" fn-name)))
+          (apply fn (map-args-to-parameters fn-tool args))))
     (error (e) (format nil "Error: ~A" e))))
 
 (defun execute-tool (tool-name args body-fn)
@@ -383,16 +426,13 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                                           (concatenate 'string
                                                       (getf (gethash id tool-call-map) :arguments)
                                                       args)))))))))))
-    ;; Convert to list of complete tool-calls (merge accumulated arguments)
+    ;; Convert to list of complete tool-calls
     (loop for id being the hash-keys of tool-call-map
           for call-data = (gethash id tool-call-map)
           when (and (getf call-data :function)
                    (not (string= (getf call-data :arguments) "")))
-          collect (let ((func-name (rest (assoc :NAME (getf call-data :function)))))
-                    (list (cons :id id)
-                          (cons :function
-                                (list (cons :NAME func-name)
-                                      (cons :ARGUMENTS (getf call-data :arguments)))))))))
+          collect (list (cons :id id)
+                       (cons :function (getf call-data :function))))))
 
 (defun convert-byte-array-to-utf8 (byte-array)
   "Convert a byte array to a UTF-8 string, trying multiple encodings if necessary."
@@ -414,15 +454,24 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                                      (dex:http-request-failed
                                       (dex:response-body e))
                                      (otherwise nil)))))
-                  (when (typep body '(vector (unsigned-byte 8)))
-                    ;; Convert byte array to string and signal a new error with string body
-                    (let ((string-body (convert-byte-array-to-utf8 body)))
-                      (error 'dex:http-request-failed
-                             :body string-body
-                             :status (dex:response-status e)
-                             :headers (dex:response-headers e)
-                             :uri (dex:request-uri e)
-                             :method (dex:request-method e))))))))
+                  (let ((string-body
+                          (cond
+                            ((typep body '(vector (unsigned-byte 8)))
+                             (convert-byte-array-to-utf8 body))
+                            ((streamp body)
+                             (ignore-errors
+                               (prog1
+                                   (with-output-to-string (s)
+                                     (loop for ch = (read-char body nil nil)
+                                           while ch do (write-char ch s)))
+                                 (close body))))
+                            ((stringp body) body)
+                            (t nil))))
+                    (when string-body
+                      (error "An HTTP request to ~S has failed (status=~A).~%~%~A"
+                             (dex:request-uri e)
+                             (dex:response-status e)
+                             string-body)))))))
     (apply #'dex:post args)))
 
 (defun completions-loop (provider endpoint headers messages payload-format-string streaming-callback)
@@ -455,7 +504,7 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                               payload-format-string streaming-callback))
           (let ((response (with-output-to-string (s)
                             (loop for obj in objs
-                                  do (when-let ((content (rest (assoc :content (rest (assoc :delta (second (assoc :choices obj))))))))
+                                  do (when-let ((content (rest (assoc :content (second (assoc :delta (assoc :choices obj)))))))
                                        (princ content s))))))
             (values response
                     (append1 messages
@@ -475,6 +524,13 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
       ba)))))
     (when *debug-stream*
       (format *debug-stream* "~&api call result: ~A~%" objs))
+    ;; Parse usage from OpenAI response
+    (when-let ((usage (rest (assoc :usage objs))))
+      (when (typep provider 'openai-completer)
+        (setf (prompt-token-count provider)
+              (or (rest (assoc :prompt--tokens usage)) 0))
+        (setf (completion-token-count provider)
+              (or (rest (assoc :completion--tokens usage)) 0))))
     (if-let ((tool-calls (rest (assoc :tool--calls (rest (assoc :message (second (assoc :choices objs))))))))
               (let ((tool-answers (loop for tool-call in tool-calls
           collect (let* ((args (json:decode-json-from-string (rest (assoc :ARGUMENTS (rest (assoc :FUNCTION tool-call))))))
@@ -604,23 +660,100 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                                            `((:role . "assistant") (:content . ,text))))))))))))
 
 (defun read-anthropic-sse-stream (stream streaming-callback)
-  "Read Anthropic SSE events from STREAM, call STREAMING-CALLBACK for text deltas, return accumulated text."
-  (with-output-to-string (acc)
-    (loop for line = (read-line stream nil 'eof)
-          until (eq line 'eof)
-          do (when *debug-stream*
-               (format *debug-stream* "~&anthropic sse: ~A~%" line))
-             (when (and (> (length line) 6) (string= "data: " (subseq line 0 6)))
-               (let* ((json (ignore-errors (json:decode-json-from-string (subseq line 6))))
-                      (type (rest (assoc :type json))))
-                 (when (and type (string= type "content_block_delta"))
-                   (let* ((delta (rest (assoc :delta json)))
-                          (delta-type (rest (assoc :type delta))))
-                     (when (string= delta-type "text_delta")
-                       (let ((text (rest (assoc :text delta))))
-                         (when text
-                           (write-string text acc)
-                           (funcall streaming-callback text)))))))))))
+  "Read Anthropic SSE events from STREAM, call STREAMING-CALLBACK for text deltas.
+Returns five values: accumulated text, input-tokens, output-tokens, content-blocks, stop-reason.
+Content-blocks is a list of alists in Anthropic API format (type text/tool_use)."
+  (let ((input-tokens 0) (output-tokens 0)
+        (content-blocks nil)
+        (current-block-type nil)
+        (current-block-meta nil)
+        (current-block-acc nil)
+        (stop-reason nil))
+    (let ((text
+            (with-output-to-string (acc)
+              (loop for line = (read-line stream nil 'eof)
+                    until (eq line 'eof)
+                    do (when *debug-stream*
+                         (format *debug-stream* "~&anthropic sse: ~A~%" line))
+                       (when (and (> (length line) 6) (string= "data: " (subseq line 0 6)))
+                         (let* ((json (ignore-errors (json:decode-json-from-string (subseq line 6))))
+                                (type (rest (assoc :type json))))
+                           (cond
+                             ;; content_block_start: begin tracking a new block
+                             ((and type (string= type "content_block_start"))
+                              (let* ((block (rest (assoc :content--block json)))
+                                     (block-type (rest (assoc :type block))))
+                                (cond
+                                  ((string= block-type "text")
+                                   (setf current-block-type "text"
+                                         current-block-meta nil
+                                         current-block-acc (make-string-output-stream)))
+                                  ((string= block-type "tool_use")
+                                   (setf current-block-type "tool_use"
+                                         current-block-meta `((:id . ,(rest (assoc :id block)))
+                                                              (:name . ,(rest (assoc :name block))))
+                                         current-block-acc (make-string-output-stream)))
+                                  (t
+                                   ;; Unknown block type (e.g. thinking) — ignore
+                                   (setf current-block-type nil
+                                         current-block-meta nil
+                                         current-block-acc nil)))))
+
+                             ;; content_block_delta: accumulate text or tool input JSON
+                             ((and type (string= type "content_block_delta"))
+                              (let* ((delta (rest (assoc :delta json)))
+                                     (delta-type (rest (assoc :type delta))))
+                                (cond
+                                  ((string= delta-type "text_delta")
+                                   (let ((text (rest (assoc :text delta))))
+                                     (when text
+                                       (write-string text acc)
+                                       (when current-block-acc
+                                         (write-string text current-block-acc))
+                                       (funcall streaming-callback text))))
+                                  ((string= delta-type "input_json_delta")
+                                   (let ((partial (rest (assoc :partial--json delta))))
+                                     (when (and partial current-block-acc)
+                                       (write-string partial current-block-acc)))))))
+
+                             ;; content_block_stop: finalize current block
+                             ((and type (string= type "content_block_stop"))
+                              (when (and current-block-type current-block-acc)
+                                (cond
+                                  ((string= current-block-type "text")
+                                   (push `((:type . "text")
+                                           (:text . ,(get-output-stream-string current-block-acc)))
+                                         content-blocks))
+                                  ((string= current-block-type "tool_use")
+                                   (let* ((json-str (get-output-stream-string current-block-acc))
+                                          (input (when (plusp (length json-str))
+                                                   (ignore-errors
+                                                     (json:decode-json-from-string json-str)))))
+                                     (push `((:type . "tool_use")
+                                             (:id . ,(rest (assoc :id current-block-meta)))
+                                             (:name . ,(rest (assoc :name current-block-meta)))
+                                             (:input . ,(or input (make-hash-table))))
+                                           content-blocks)))))
+                              (setf current-block-type nil
+                                    current-block-meta nil
+                                    current-block-acc nil))
+
+                             ;; message_start: get input token count
+                             ((and type (string= type "message_start"))
+                              (when-let ((usage (rest (assoc :usage (rest (assoc :message json))))))
+                                (setf input-tokens (or (rest (assoc :input--tokens usage)) 0))))
+
+                             ;; message_delta: get output token count and stop reason
+                             ((and type (string= type "message_delta"))
+                              (when-let ((delta (rest (assoc :delta json))))
+                                (setf stop-reason (rest (assoc :stop--reason delta))))
+                              (when-let ((usage (rest (assoc :usage json))))
+                                (setf output-tokens (or (rest (assoc :output--tokens usage)) 0)))))))))))
+      (values text
+              input-tokens
+              output-tokens
+              (nreverse content-blocks)
+              stop-reason))))
 
 (defmethod get-completion ((provider anthropic-completer) messages &key (max-tokens 1024) (streaming-callback nil) (response-format nil))
   (when (stringp messages)
@@ -628,8 +761,6 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
 
   (with-slots (endpoint api-key model tools) provider
 
-    (when (and streaming-callback tools)
-      (error "streaming-callback and tools cannot be used together with anthropic completer"))
     (let* ((system-text
              (with-output-to-string (s)
                (loop for msg in messages
@@ -647,50 +778,91 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                    collect msg))
            (tools-rendered
              (when tools
-               (loop for tool-symbol in tools
-                     collect (if-let ((tool (gethash (symbol-name tool-symbol) *tools*)))
-                               (render-anthropic tool)
-                               (error "Undefined tool function: ~A" tool-symbol)))))
+               (let ((rendered (loop for tool-symbol in tools
+                                     collect (if-let ((tool (gethash (symbol-name tool-symbol) *tools*)))
+                                               (render-anthropic tool)
+                                               (error "Undefined tool function: ~A" tool-symbol)))))
+                 ;; Add cache_control to last tool for prompt caching
+                 (when rendered
+                   (let ((last-tool (car (last rendered))))
+                     (nconc last-tool `(("cache_control" . (("type" . "ephemeral")))))))
+                 rendered)))
            (headers `(("x-api-key" . ,api-key)
                       ("anthropic-version" . "2023-06-01")
+                      ("Content-Type" . "application/json")
                       ,@(when response-format
                           `(("anthropic-beta" . "structured-outputs-2025-11-13")))))
            (api-messages non-system-messages))
 
       (if streaming-callback
 
-          ;; Streaming path (no tools)
-          (let* ((payload `((:model . ,model)
+          ;; Streaming path (with tool support)
+          (loop
+            for payload = `((:model . ,model)
                             (:max_tokens . ,max-tokens)
                             (:stream . t)
                             ,@(when (> (length system-text) 0)
-                                `(("system" . ,(string-trim " " system-text))))
+                                `(("system" . ,(make-array 1 :initial-contents
+                                                 (list `((:type . "text")
+                                                         (:text . ,(string-trim " " system-text))
+                                                         ("cache_control" . (("type" . "ephemeral")))))))))
                             ,@(when response-format
                                 `((:output_format . ((:type . ,response-format)))))
+                            ,@(when tools-rendered
+                                `((:tools . ,(make-array (length tools-rendered)
+                                                         :initial-contents tools-rendered))))
                             (:messages . ,(make-array (length api-messages)
-                                                      :initial-contents api-messages))))
-                 (content (json:encode-json-to-string payload)))
-            (when *debug-stream*
-              (format *debug-stream* "~&anthropic streaming request: ~A~%" content))
-            (let ((response-stream (safe-http-request endpoint
-                                              :read-timeout *read-timeout*
-                                              :content content
-                                              :headers headers
-                                              :content-type "application/json"
-                                              :want-stream t)))
-              (unwind-protect
-                   (let ((text (read-anthropic-sse-stream response-stream streaming-callback)))
-                     (values text
-                             (append1 messages
-                                      `((:role . "assistant") (:content . ,text)))))
-                (close response-stream))))
+                                                      :initial-contents api-messages)))
+            for json-content = (json:encode-json-to-string payload)
+            for _s1 = (when *debug-stream*
+                        (format *debug-stream* "~&anthropic streaming request: ~A~%" json-content))
+            for response-stream = (safe-http-request endpoint
+                                            :read-timeout *read-timeout*
+                                            :content json-content
+                                            :headers headers
+                                            :want-stream t)
+            for (text in-tokens out-tokens content-blocks stop-reason) =
+                (unwind-protect
+                     (multiple-value-list
+                      (read-anthropic-sse-stream response-stream streaming-callback))
+                  (close response-stream))
+            for _s2 = (progn (setf (prompt-token-count provider) in-tokens)
+                             (setf (completion-token-count provider) out-tokens))
+            for tool-use-blocks = (when content-blocks
+                                    (remove-if-not
+                                     (lambda (b) (string= (rest (assoc :type b)) "tool_use"))
+                                     content-blocks))
+            while tool-use-blocks
+            do (let ((tool-results
+                       (loop for block in tool-use-blocks
+                             for tool-id = (rest (assoc :id block))
+                             for fn-name = (rest (assoc :name block))
+                             for fn-args = (rest (assoc :input block))
+                             collect `((:type . "tool_result")
+                                       ("tool_use_id" . ,tool-id)
+                                       (:content . ,(invoke-tool fn-name fn-args))))))
+                 (setf api-messages
+                       (append api-messages
+                               (list `((:role . "assistant")
+                                       (:content . ,(make-array (length content-blocks)
+                                                                :initial-contents content-blocks))))
+                               (list `((:role . "user")
+                                       (:content . ,(make-array (length tool-results)
+                                                                :initial-contents tool-results)))))))
+            finally
+              (return (values text
+                              (append1 messages
+                                       `((:role . "assistant") (:content . ,text))))))
 
           ;; Non-streaming tool-calling loop
           (loop
             for payload = `((:model . ,model)
                             (:max_tokens . ,max-tokens)
                             ,@(when (> (length system-text) 0)
-                                `(("system" . ,(string-trim " " system-text))))
+                                `(("system" . ,(make-array 1 :initial-contents
+                                                 (list `((:type . "text")
+                                                         (:text . ,(string-trim " " system-text))
+                                                         ("cache_control" . (("type" . "ephemeral")))))))))
                             ,@(when response-format
                                 `((:output_format . ((:type . ,response-format)))))
                             ,@(when tools-rendered
@@ -707,12 +879,23 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                                          :read-timeout *read-timeout*
                                          :content content
                                          :headers headers
-                                         :content-type "application/json"
                                          :force-binary t
                                          :want-stream nil)))
             for _a2 = (when *debug-stream*
                         (format *debug-stream* "~&anthropic response: ~A~%" response))
-            for content-blocks = (rest (assoc :content response))
+            for _a3 = (when-let ((usage (rest (assoc :usage response))))
+                        (setf (prompt-token-count provider)
+                              (or (rest (assoc :input--tokens usage)) 0))
+                        (setf (completion-token-count provider)
+                              (or (rest (assoc :output--tokens usage)) 0)))
+            for content-blocks = (mapcar
+                                   (lambda (block)
+                                     (if (and (string= (rest (assoc :type block)) "tool_use")
+                                              (null (rest (assoc :input block))))
+                                         (cons (cons :input (make-hash-table))
+                                               (remove :input block :key #'car))
+                                         block))
+                                   (rest (assoc :content response)))
             for tool-use-blocks = (loop for block in content-blocks
                                         when (string= (rest (assoc :type block)) "tool_use")
                                         collect block)
@@ -745,7 +928,7 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
 (defmethod render-gemini ((tool function-tool))
   "Render a function-tool as a Gemini functionDeclaration."
   (with-slots (description name parameters) tool
-    `((:name . ,name)
+    `((:name . ,(string-downcase name))
       (:description . ,description)
       ,@(when parameters
           `((:parameters . ((:type . "object")
@@ -771,8 +954,9 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                                                        collect (first p))))))))
       `((:name . ,name)
         (:description . ,description)
-        ,@(when schema
-            `(("input_schema" . ,schema)))))))
+        ("input_schema" . ,(or schema
+                               '(("type" . "object")
+                                 ("properties" . nil))))))))
 
 (defun extract-system-instruction (messages)
   "Extract system messages from MESSAGES and return a Gemini systemInstruction object, or nil."
@@ -851,12 +1035,12 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
     (setf messages `(((:role . "user") (:content . ,messages)))))
 
   (with-slots (api-key model tools) provider
-    (let* ((non-streaming-endpoint
-             (format nil "https://generativelanguage.googleapis.com/v1beta/models/~A:generateContent?key=~A"
-                     model api-key))
-           (streaming-endpoint
-             (format nil "https://generativelanguage.googleapis.com/v1beta/models/~A:streamGenerateContent?alt=sse&key=~A"
-                     model api-key))
+
+    (let* ((use-streaming (and streaming-callback (not tools)))
+           (endpoint (format nil "https://generativelanguage.googleapis.com/v1beta/models/~A:~A~A"
+                             model
+                             (if use-streaming "streamGenerateContent?alt=sse&key=" "generateContent?key=")
+                             api-key))
            (tools-rendered
              (when tools
                (loop for tool-symbol in tools
@@ -867,10 +1051,34 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
            (contents (convert-messages-to-gemini messages))
            (headers `(("Content-Type" . "application/json"))))
 
-      ;; Tool-calling loop (non-streaming rounds), then final response
-      (loop
+      (if use-streaming
+
+          ;; Streaming path (no tools)
+          (let* ((payload (gemini-make-payload contents nil max-tokens system-instruction response-format))
+                 (content (json:encode-json-to-string payload)))
+            (when *debug-stream*
+              (format *debug-stream* "~&gemini streaming request: ~A~%" content))
+            (let ((response-stream (safe-http-request endpoint
+                                              :read-timeout *read-timeout*
+                                              :content content
+                                              :headers headers
+                                              :want-stream t)))
+              (unwind-protect
+                   (let ((text (read-gemini-sse-stream response-stream streaming-callback)))
+                     (values text
+                             (append1 messages
+                                      `((:role . "assistant") (:content . ,text)))))
+                (close response-stream))))
+
+          ;; Non-streaming tool-calling loop
+          (loop
         for payload = (gemini-make-payload contents tools-rendered max-tokens system-instruction response-format)
-        for response = (gemini-call non-streaming-endpoint payload headers)
+        for response = (gemini-call endpoint payload headers)
+        for _g1 = (when-let ((usage (rest (assoc :usage-metadata response))))
+                    (setf (prompt-token-count provider)
+                          (or (rest (assoc :prompt-token-count usage)) 0))
+                    (setf (completion-token-count provider)
+                          (or (rest (assoc :candidates-token-count usage)) 0)))
         for candidate = (first (rest (assoc :candidates response)))
         for parts = (rest (assoc :parts (rest (assoc :content candidate))))
         for fn-calls = (loop for part in parts
@@ -881,32 +1089,17 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                    (loop for fn-call in fn-calls
                          for fn-name = (rest (assoc :name fn-call))
                          for fn-args = (rest (assoc :args fn-call))
+                         for tool-key = (string-upcase fn-name)
                          collect `((:function-response
                                     . ((:name . ,fn-name)
-                                       (:response . ((:content . ,(invoke-tool fn-name fn-args))))))))))
+                                       (:response . ((:content . ,(invoke-tool tool-key fn-args))))))))))
              (setf contents (append contents
                                     (list `((:role . "model") (:parts . ,parts)))
                                     (list `((:role . "user") (:parts . ,tool-results))))))
         finally
-          (if streaming-callback
-              ;; Stream the final text response
-              (let* ((stream-payload (gemini-make-payload contents nil max-tokens system-instruction response-format))
-                     (stream-content (json:encode-json-to-string stream-payload)))
-                (when *debug-stream*
-                  (format *debug-stream* "~&gemini streaming request: ~A~%" stream-content))
-                (let ((response-stream (safe-http-request streaming-endpoint
-                                                :read-timeout *read-timeout*
-                                                :content stream-content
-                                                :headers headers
-                                                :want-stream t)))
-                  (unwind-protect
-                       (let ((text (read-gemini-sse-stream response-stream streaming-callback)))
-                         (return (values text
-                                         (append1 messages
-                                                  `((:role . "assistant") (:content . ,text))))))
-                    (close response-stream))))
-              ;; Return the already-fetched non-streaming response
-              (let ((text (rest (assoc :text (first parts)))))
-                (return (values text
-                                (append1 messages
-                                         `((:role . "assistant") (:content . ,text)))))))))))
+          (let ((text (rest (assoc :text (first parts)))))
+            (when (and streaming-callback text)
+              (funcall streaming-callback text))
+            (return (values text
+                            (append1 messages
+                                     `((:role . "assistant") (:content . ,text)))))))))))

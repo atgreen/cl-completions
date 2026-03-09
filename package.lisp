@@ -28,12 +28,16 @@
   (:documentation "A Common Lisp library for interacting with LLM completion APIs including OpenAI,
    Anthropic, and Ollama, with support for tool calling, streaming, and safety features.")
   (:export completer openai-completer ollama-completer anthropic-completer gemini-completer get-completion defun-tool *read-timeout* *debug-stream*
+           ;; Token counting
+           prompt-token-count completion-token-count total-tokens-used reset-token-counts
            ;; Permission and safety system
            *permission-callback* *default-safety-level* *safe-tools*
            ;; Tool classification
            get-tool-safety-level set-tool-safety-level
            ;; Context binding
            *tool-context-vars*
+           ;; Tool interceptor
+           *tool-interceptor*
            ;; Event hooks
            *tool-start-hooks* *tool-complete-hooks* *tool-error-hooks*
            ;; Tool discovery and introspection
