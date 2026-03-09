@@ -568,15 +568,15 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                                                              :initial-contents tools-rendered))))
                                 (:messages . ,(make-array (length api-messages)
                                                           :initial-contents api-messages))))
-              do (when *debug-stream*
-                   (format *debug-stream* "~&ollama request: ~A~%" content))
+              for _o1 = (when *debug-stream*
+                          (format *debug-stream* "~&ollama request: ~A~%" content))
               for response = (json:decode-json-from-string
                                (safe-http-request endpoint
                                          :read-timeout *read-timeout*
                                          :content content
                                          :headers headers))
-              do (when *debug-stream*
-                   (format *debug-stream* "~&ollama response: ~A~%" response))
+              for _o2 = (when *debug-stream*
+                          (format *debug-stream* "~&ollama response: ~A~%" response))
               for message = (rest (assoc :message response))
               for tool-calls = (rest (assoc :tool--calls message))
               while tool-calls
@@ -607,17 +607,17 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
           until (eq line 'eof)
           do (when *debug-stream*
                (format *debug-stream* "~&anthropic sse: ~A~%" line))
-          when (and (> (length line) 6) (string= "data: " (subseq line 0 6)))
-          do (let* ((json (ignore-errors (json:decode-json-from-string (subseq line 6))))
-                    (type (rest (assoc :type json))))
-               (when (and type (string= type "content_block_delta"))
-                 (let* ((delta (rest (assoc :delta json)))
-                        (delta-type (rest (assoc :type delta))))
-                   (when (string= delta-type "text_delta")
-                     (let ((text (rest (assoc :text delta))))
-                       (when text
-                         (write-string text acc)
-                         (funcall streaming-callback text))))))))))
+             (when (and (> (length line) 6) (string= "data: " (subseq line 0 6)))
+               (let* ((json (ignore-errors (json:decode-json-from-string (subseq line 6))))
+                      (type (rest (assoc :type json))))
+                 (when (and type (string= type "content_block_delta"))
+                   (let* ((delta (rest (assoc :delta json)))
+                          (delta-type (rest (assoc :type delta))))
+                     (when (string= delta-type "text_delta")
+                       (let ((text (rest (assoc :text delta))))
+                         (when text
+                           (write-string text acc)
+                           (funcall streaming-callback text)))))))))))
 
 (defmethod get-completion ((provider anthropic-completer) messages &key (max-tokens 1024) (streaming-callback nil) (response-format nil))
   (when (stringp messages)
@@ -696,8 +696,8 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                             (:messages . ,(make-array (length api-messages)
                                                       :initial-contents api-messages)))
             for content = (json:encode-json-to-string payload)
-            do (when *debug-stream*
-                 (format *debug-stream* "~&anthropic request: ~A~%" content))
+            for _a1 = (when *debug-stream*
+                        (format *debug-stream* "~&anthropic request: ~A~%" content))
             for response = (json:decode-json-from-string
                              (convert-byte-array-to-utf8
                                (safe-http-request endpoint
@@ -707,8 +707,8 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                                          :content-type "application/json"
                                          :force-binary t
                                          :want-stream nil)))
-            do (when *debug-stream*
-                 (format *debug-stream* "~&anthropic response: ~A~%" response))
+            for _a2 = (when *debug-stream*
+                        (format *debug-stream* "~&anthropic response: ~A~%" response))
             for content-blocks = (rest (assoc :content response))
             for tool-use-blocks = (loop for block in content-blocks
                                         when (string= (rest (assoc :type block)) "tool_use")
@@ -834,14 +834,14 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
           until (eq line 'eof)
           do (when *debug-stream*
                (format *debug-stream* "~&gemini sse: ~A~%" line))
-          when (and (> (length line) 6) (string= "data: " (subseq line 0 6)))
-          do (let* ((json (ignore-errors (json:decode-json-from-string (subseq line 6))))
-                    (candidates (rest (assoc :candidates json)))
-                    (parts (rest (assoc :parts (rest (assoc :content (first candidates))))))
-                    (text (rest (assoc :text (first parts)))))
-               (when text
-                 (write-string text acc)
-                 (funcall streaming-callback text))))))
+             (when (and (> (length line) 6) (string= "data: " (subseq line 0 6)))
+               (let* ((json (ignore-errors (json:decode-json-from-string (subseq line 6))))
+                      (candidates (rest (assoc :candidates json)))
+                      (parts (rest (assoc :parts (rest (assoc :content (first candidates))))))
+                      (text (rest (assoc :text (first parts)))))
+                 (when text
+                   (write-string text acc)
+                   (funcall streaming-callback text)))))))
 
 (defmethod get-completion ((provider gemini-completer) messages &key (max-tokens 1024) (streaming-callback nil) (response-format nil))
   (when (stringp messages)
