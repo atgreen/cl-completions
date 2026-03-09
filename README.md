@@ -226,7 +226,7 @@ All four providers support streaming via the `:streaming-callback` keyword. The 
                 :streaming-callback (lambda (text) (princ text)))
 ```
 
-**Note:** OpenAI and Gemini support streaming with tools (tool calls use non-streaming rounds, then the final response is streamed). Anthropic and Ollama do not currently support combining streaming with tools.
+**Note:** OpenAI, Anthropic, and Gemini support streaming with tools (tool calls are handled automatically within the streaming loop). Ollama does not currently support combining streaming with tools.
 
 ### Structured Output (response-format)
 
@@ -239,6 +239,36 @@ OpenAI, Anthropic, and Gemini support structured output via the `:response-forma
 ;; Gemini (json_object maps to application/json MIME type)
 (get-completion completer messages :response-format "json_object")
 ```
+
+### Token Tracking
+
+All completers track token usage. After a `get-completion` call, you can inspect how many tokens were used:
+
+```lisp
+(let ((c (make-instance 'openai-completer :api-key (uiop:getenv "OPENAI_API_KEY"))))
+  (get-completion c "Hello!" :max-tokens 100)
+  (format t "Prompt tokens: ~A~%" (prompt-token-count c))
+  (format t "Completion tokens: ~A~%" (completion-token-count c))
+  (format t "Total tokens: ~A~%" (total-tokens-used c))
+  (reset-token-counts c))
+```
+
+### Tool Interceptor
+
+The `*tool-interceptor*` variable allows you to intercept tool calls before they are executed. When set, it is called with the tool name and arguments. If it returns a non-nil string, that string is used as the tool result and normal execution is skipped:
+
+```lisp
+(setf *tool-interceptor*
+      (lambda (tool-name args)
+        (when (string= tool-name "DANGEROUS-TOOL")
+          "Tool execution blocked by interceptor")))
+```
+
+This is useful for client-side tool delegation or sandboxing.
+
+### Prompt Caching (Anthropic)
+
+When using the Anthropic completer, `cache_control` markers are automatically added to system messages and the last tool definition. This enables [Anthropic's prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching) to reduce costs and latency for repeated calls with the same system prompt or tool definitions.
 
 ### Error Handling
 
