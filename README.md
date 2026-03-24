@@ -240,6 +240,41 @@ OpenAI, Anthropic, and Gemini support structured output via the `:response-forma
 (get-completion completer messages :response-format "json_object")
 ```
 
+### Multimodal Content (Images, PDFs)
+
+Helper functions create provider-specific content blocks for binary attachments. Since each API has a different format, the block-building functions are generic and dispatch on the completer:
+
+```lisp
+;; The easy way — read a file and build a block in one step
+(let* ((c (make-instance 'anthropic-completer :api-key (uiop:getenv "ANTHROPIC_API_KEY")))
+       (image-block (make-file-block c "photo.png"))
+       (text-block (make-text-block c "What's in this image?"))
+       (content (make-content-blocks c image-block text-block)))
+  (get-completion c `(((:role . "user") (:content . ,content))) :max-tokens 200))
+```
+
+The same code works with any completer — just swap the class:
+
+```lisp
+;; Works with OpenAI, Gemini, Ollama too
+(let* ((c (make-instance 'openai-completer :api-key (uiop:getenv "OPENAI_API_KEY")))
+       (block (make-file-block c "photo.png"))
+       (text (make-text-block c "Describe this image"))
+       (content (make-content-blocks c block text)))
+  (get-completion c `(((:role . "user") (:content . ,content))) :max-tokens 200))
+```
+
+For more control, build blocks manually:
+
+```lisp
+(let* ((c (make-instance 'anthropic-completer :api-key (uiop:getenv "ANTHROPIC_API_KEY")))
+       (base64-data (file-to-base64 "document.pdf"))
+       (block (make-base64-block c "document" base64-data "application/pdf")))
+  ...)
+```
+
+`media-type-from-path` infers MIME types from file extensions (png, jpg, jpeg, gif, webp, pdf).
+
 ### Token Tracking
 
 All completers track token usage. After a `get-completion` call, you can inspect how many tokens were used:

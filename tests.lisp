@@ -221,26 +221,92 @@
            (is (string= "SGVsbG8=" result)))
       (delete-file path))))
 
-(test make-text-block-structure
-  "make-text-block produces correct alist structure."
-  (let ((block (completions:make-text-block "hello")))
+(test make-text-block-default
+  "make-text-block for OpenAI/Anthropic produces type+text alist."
+  (let* ((c (make-instance 'completions:anthropic-completer :api-key "test" :model "test"))
+         (block (completions:make-text-block c "hello")))
     (is (string= "text" (cdr (assoc :type block))))
     (is (string= "hello" (cdr (assoc :text block))))))
 
-(test make-base64-block-structure
-  "make-base64-block produces correct nested alist for base64 content."
-  (let ((block (completions:make-base64-block "document" "AQID" "application/pdf")))
+(test make-text-block-gemini
+  "make-text-block for Gemini produces text-only alist without type."
+  (let* ((c (make-instance 'completions:gemini-completer :api-key "test" :model "test"))
+         (block (completions:make-text-block c "hello")))
+    (is (null (assoc :type block)))
+    (is (string= "hello" (cdr (assoc :text block))))))
+
+(test make-base64-block-anthropic
+  "make-base64-block for Anthropic produces correct nested alist."
+  (let* ((c (make-instance 'completions:anthropic-completer :api-key "test" :model "test"))
+         (block (completions:make-base64-block c "document" "AQID" "application/pdf")))
     (is (string= "document" (cdr (assoc :type block))))
     (let ((source (cdr (assoc :source block))))
       (is (string= "base64" (cdr (assoc :type source))))
       (is (string= "application/pdf" (cdr (assoc "media_type" source :test #'string=))))
       (is (string= "AQID" (cdr (assoc :data source)))))))
 
-(test make-content-blocks-vector
-  "make-content-blocks returns a vector of the given blocks."
-  (let* ((t1 (completions:make-text-block "hello"))
-         (t2 (completions:make-text-block "world"))
-         (result (completions:make-content-blocks t1 t2)))
+(test make-base64-block-openai
+  "make-base64-block for OpenAI produces a data-URI image_url block."
+  (let* ((c (make-instance 'completions:openai-completer :api-key "test" :model "test"))
+         (block (completions:make-base64-block c "image" "AQID" "image/png")))
+    (is (string= "image_url" (cdr (assoc :type block))))
+    (let ((image-url (cdr (assoc :image-url block))))
+      (is (string= "data:image/png;base64,AQID" (cdr (assoc :url image-url)))))))
+
+(test make-base64-block-ollama
+  "make-base64-block for Ollama produces same format as OpenAI."
+  (let* ((c (make-instance 'completions:ollama-completer :model "test"))
+         (block (completions:make-base64-block c "image" "AQID" "image/png")))
+    (is (string= "image_url" (cdr (assoc :type block))))
+    (let ((image-url (cdr (assoc :image-url block))))
+      (is (string= "data:image/png;base64,AQID" (cdr (assoc :url image-url)))))))
+
+(test make-base64-block-gemini
+  "make-base64-block for Gemini produces an inline-data block."
+  (let* ((c (make-instance 'completions:gemini-completer :api-key "test" :model "test"))
+         (block (completions:make-base64-block c "image" "AQID" "image/png")))
+    (let ((inline-data (cdr (assoc :inline-data block))))
+      (is (string= "image/png" (cdr (assoc :mime-type inline-data))))
+      (is (string= "AQID" (cdr (assoc :data inline-data)))))))
+
+(test make-content-blocks-default
+  "make-content-blocks returns a vector for non-Gemini completers."
+  (let* ((c (make-instance 'completions:anthropic-completer :api-key "test" :model "test"))
+         (t1 (completions:make-text-block c "hello"))
+         (t2 (completions:make-text-block c "world"))
+         (result (completions:make-content-blocks c t1 t2)))
     (is (vectorp result))
     (is (= 2 (length result)))
     (is (string= "hello" (cdr (assoc :text (aref result 0)))))))
+
+(test make-content-blocks-gemini
+  "make-content-blocks for Gemini wraps blocks in a :parts alist."
+  (let* ((c (make-instance 'completions:gemini-completer :api-key "test" :model "test"))
+         (t1 (completions:make-text-block c "hello"))
+         (result (completions:make-content-blocks c t1)))
+    (let ((parts (cdr (assoc :parts result))))
+      (is (vectorp parts))
+      (is (= 1 (length parts)))
+      (is (string= "hello" (cdr (assoc :text (aref parts 0))))))))
+
+(test media-type-from-path
+  "media-type-from-path infers correct MIME types."
+  (is (string= "image/png" (completions:media-type-from-path "photo.png")))
+  (is (string= "image/jpeg" (completions:media-type-from-path "photo.jpg")))
+  (is (string= "image/jpeg" (completions:media-type-from-path "photo.JPEG")))
+  (is (string= "application/pdf" (completions:media-type-from-path "doc.pdf"))))
+
+(test make-file-block-roundtrip
+  "make-file-block reads a file and produces a provider-specific block."
+  (let ((path (merge-pathnames "test-image.png" (uiop:temporary-directory)))
+        (c (make-instance 'completions:anthropic-completer :api-key "test" :model "test")))
+    (with-open-file (s path :direction :output :element-type '(unsigned-byte 8)
+                            :if-exists :supersede)
+      (write-sequence #(137 80 78 71) s))
+    (unwind-protect
+         (let ((block (completions:make-file-block c path)))
+           (is (string= "image" (cdr (assoc :type block))))
+           (let ((source (cdr (assoc :source block))))
+             (is (string= "image/png" (cdr (assoc "media_type" source :test #'string=))))
+             (is (stringp (cdr (assoc :data source))))))
+      (delete-file path))))

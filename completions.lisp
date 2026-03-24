@@ -130,24 +130,76 @@ If it returns nil, normal tool execution proceeds.")
   (setf (prompt-token-count c) 0 (completion-token-count c) 0))
 
 (defun file-to-base64 (path)
-  "Read a binary file and return its contents as base64-encoded string."
+  "Read a binary file and return its contents as a base64-encoded string."
   (with-open-file (stream path :element-type '(unsigned-byte 8))
-	(let* ((length (file-length stream))
-		   (bytes (make-array length :element-type '(unsigned-byte 8))))
-	  (read-sequence bytes stream)
-	  (cl-base64:usb8-array-to-base64-string bytes))))
+    (let* ((length (file-length stream))
+           (bytes (make-array length :element-type '(unsigned-byte 8))))
+      (read-sequence bytes stream)
+      (cl-base64:usb8-array-to-base64-string bytes))))
 
-(defun make-text-block (text)
+(defgeneric make-text-block (completer text)
+  (:documentation "Create a text content block in the format expected by the completer's API."))
+
+(defmethod make-text-block ((c completer) text)
   (list (cons :type "text") (cons :text text)))
 
-(defun make-base64-block (block-type base64-data media-type)
+(defmethod make-text-block ((c gemini-completer) text)
+  (list (cons :text text)))
+
+(defgeneric make-base64-block (completer block-type base64-data media-type)
+  (:documentation "Create a base64 content block in the format expected by the completer's API."))
+
+(defmethod make-base64-block ((c anthropic-completer) block-type base64-data media-type)
   (list (cons :type block-type)
         (cons :source (list (cons :type "base64")
                             (cons "media_type" media-type)
                             (cons :data base64-data)))))
 
-(defun make-content-blocks (&rest blocks)
+(defmethod make-base64-block ((c openai-completer) block-type base64-data media-type)
+  (list (cons :type "image_url")
+        (cons :image-url (list (cons :url (format nil "data:~A;base64,~A"
+                                                  media-type base64-data))))))
+
+(defmethod make-base64-block ((c ollama-completer) block-type base64-data media-type)
+  (list (cons :type "image_url")
+        (cons :image-url (list (cons :url (format nil "data:~A;base64,~A"
+                                                  media-type base64-data))))))
+
+(defmethod make-base64-block ((c gemini-completer) block-type base64-data media-type)
+  (list (cons :inline-data (list (cons :mime-type media-type)
+                                 (cons :data base64-data)))))
+
+(defgeneric make-content-blocks (completer &rest blocks)
+  (:documentation "Combine content blocks into the structure expected by the completer's API."))
+
+(defmethod make-content-blocks ((c completer) &rest blocks)
   (make-array (length blocks) :initial-contents blocks))
+
+(defmethod make-content-blocks ((c gemini-completer) &rest blocks)
+  (list (cons :parts (make-array (length blocks) :initial-contents blocks))))
+
+(defun media-type-from-path (path)
+  "Infer a MIME type from the file extension of PATH."
+  (let ((ext (string-downcase (pathname-type (pathname path)))))
+    (cond ((string= ext "png") "image/png")
+          ((string= ext "jpg") "image/jpeg")
+          ((string= ext "jpeg") "image/jpeg")
+          ((string= ext "gif") "image/gif")
+          ((string= ext "webp") "image/webp")
+          ((string= ext "pdf") "application/pdf")
+          (t (format nil "application/~A" ext)))))
+
+(defun make-file-block (completer path &optional block-type)
+  "Read a file, encode it as base64, and return a content block for the completer.
+   The media type is inferred from the file extension. BLOCK-TYPE defaults to the
+   inferred type category (e.g. \"image\" or \"document\")."
+  (let* ((media-type (media-type-from-path path))
+         (base64-data (file-to-base64 path))
+         (block-type (or block-type
+                         (if (str:starts-with-p "image/" media-type)
+                             "image"
+                             "document"))))
+    (make-base64-block completer block-type base64-data media-type)))
 
 (defclass tool ()
   ()

@@ -30,8 +30,9 @@
   (:export completer openai-completer ollama-completer anthropic-completer gemini-completer get-completion defun-tool *read-timeout* *debug-stream*
            ;; Token counting
            prompt-token-count completion-token-count total-tokens-used reset-token-counts
-		   ;; Binary attachments
-		   file-to-base64 make-text-block make-base64-block make-content-blocks
+           ;; Multimodal content helpers
+           file-to-base64 make-text-block make-base64-block make-content-blocks
+           media-type-from-path make-file-block
            ;; Permission and safety system
            *permission-callback* *default-safety-level* *safe-tools*
            ;; Tool classification
