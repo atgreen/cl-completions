@@ -204,3 +204,43 @@
          (payload (completions::gemini-make-payload contents nil 100 nil "json_object")))
     (let ((config (cdr (assoc :generation-config payload))))
       (is (string= "application/json" (cdr (assoc :response-mime-type config)))))))
+
+;;; ---- Content block helper tests ----
+
+(test file-to-base64-roundtrip
+  "file-to-base64 encodes a file to valid base64."
+  (let ((path (uiop:with-temporary-file (:stream s
+                                         :element-type '(unsigned-byte 8)
+                                         :pathname p
+                                         :keep t)
+                (write-sequence #(72 101 108 108 111) s)
+                p)))
+    (unwind-protect
+         (let ((result (completions:file-to-base64 path)))
+           (is (stringp result))
+           (is (string= "SGVsbG8=" result)))
+      (delete-file path))))
+
+(test make-text-block-structure
+  "make-text-block produces correct alist structure."
+  (let ((block (completions:make-text-block "hello")))
+    (is (string= "text" (cdr (assoc :type block))))
+    (is (string= "hello" (cdr (assoc :text block))))))
+
+(test make-base64-block-structure
+  "make-base64-block produces correct nested alist for base64 content."
+  (let ((block (completions:make-base64-block "document" "AQID" "application/pdf")))
+    (is (string= "document" (cdr (assoc :type block))))
+    (let ((source (cdr (assoc :source block))))
+      (is (string= "base64" (cdr (assoc :type source))))
+      (is (string= "application/pdf" (cdr (assoc "media_type" source :test #'string=))))
+      (is (string= "AQID" (cdr (assoc :data source)))))))
+
+(test make-content-blocks-vector
+  "make-content-blocks returns a vector of the given blocks."
+  (let* ((t1 (completions:make-text-block "hello"))
+         (t2 (completions:make-text-block "world"))
+         (result (completions:make-content-blocks t1 t2)))
+    (is (vectorp result))
+    (is (= 2 (length result)))
+    (is (string= "hello" (cdr (assoc :text (aref result 0)))))))

@@ -129,6 +129,26 @@ If it returns nil, normal tool execution proceeds.")
 (defmethod reset-token-counts ((c gemini-completer))
   (setf (prompt-token-count c) 0 (completion-token-count c) 0))
 
+(defun file-to-base64 (path)
+  "Read a binary file and return its contents as base64-encoded string."
+  (with-open-file (stream path :element-type '(unsigned-byte 8))
+	(let* ((length (file-length stream))
+		   (bytes (make-array length :element-type '(unsigned-byte 8))))
+	  (read-sequence bytes stream)
+	  (cl-base64:usb8-array-to-base64-string bytes))))
+
+(defun make-text-block (text)
+  (list (cons :type "text") (cons :text text)))
+
+(defun make-base64-block (block-type base64-data media-type)
+  (list (cons :type block-type)
+        (cons :source (list (cons :type "base64")
+                            (cons "media_type" media-type)
+                            (cons :data base64-data)))))
+
+(defun make-content-blocks (&rest blocks)
+  (make-array (length blocks) :initial-contents blocks))
+
 (defclass tool ()
   ()
   (:documentation "Base class for tools that can be called by LLM completions."))
