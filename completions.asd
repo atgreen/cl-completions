@@ -31,7 +31,7 @@
   :serial t
   :components ((:file "package")
                (:file "completions"))
-  :depends-on (:dexador :cl-json :flexi-streams :babel :str :alexandria :serapeum))
+  :depends-on (:dexador :cl-json :flexi-streams :babel :str :alexandria :serapeum :cl-base64))
 
 (asdf:defsystem "completions/tests"
   :description "Tests for the completions library"
