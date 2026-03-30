@@ -244,3 +244,10 @@
     (is (vectorp result))
     (is (= 2 (length result)))
     (is (string= "hello" (cdr (assoc :text (aref result 0)))))))
+
+;;; ---- JSON encoding tests ----
+
+(test false-encoding
+      "Test that :false is encoded as the JSON boolean false, not the string \"false\"."
+      (let ((encoded (json:encode-json-to-string '((:stream . :false)))))
+        (is (string= "{\"stream\":false}" encoded))))
