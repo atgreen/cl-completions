@@ -26,8 +26,7 @@
 (in-package :completions)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-  (setf json::+json-lisp-symbol-tokens+
-        (append '(("false" . :false)) json::+json-lisp-symbol-tokens+)))
+  (pushnew '("false" . :false) json::+json-lisp-symbol-tokens+ :test 'equal))
 
 ;; Set this to an output stream to see debug logs.
 (defvar *debug-stream* nil)
