@@ -543,10 +543,15 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                             ((stringp body) body)
                             (t nil))))
                     (when string-body
-                      (error "An HTTP request to ~S has failed (status=~A).~%~%~A"
-                             (dex:request-uri e)
-                             (dex:response-status e)
-                             string-body)))))))
+                      ;; CLSEC-2026-0002: Redact query parameters from error URIs
+                      ;; to prevent credential leakage in logs and error handlers.
+                      (let* ((uri (princ-to-string (dex:request-uri e)))
+                             (qpos (position #\? uri))
+                             (safe-uri (if qpos (subseq uri 0 qpos) uri)))
+                        (error "An HTTP request to ~S has failed (status=~A).~%~%~A"
+                               safe-uri
+                               (dex:response-status e)
+                               string-body))))))))
     (apply #'dex:post args)))
 
 (defun completions-loop (provider endpoint headers messages payload-format-string streaming-callback)
@@ -1111,11 +1116,13 @@ Content-blocks is a list of alists in Anthropic API format (type text/tool_use).
 
   (with-slots (api-key model tools) provider
 
+    ;; CLSEC-2026-0001: Move API key from URL query parameter to header.
+    ;; The key was previously appended to the URL, leaking it in logs,
+    ;; error messages, and proxy access logs.
     (let* ((use-streaming (and streaming-callback (not tools)))
-           (endpoint (format nil "https://generativelanguage.googleapis.com/v1beta/models/~A:~A~A"
+           (endpoint (format nil "https://generativelanguage.googleapis.com/v1beta/models/~A:~A"
                              model
-                             (if use-streaming "streamGenerateContent?alt=sse&key=" "generateContent?key=")
-                             api-key))
+                             (if use-streaming "streamGenerateContent?alt=sse" "generateContent")))
            (tools-rendered
              (when tools
                (loop for tool-symbol in tools
@@ -1124,7 +1131,8 @@ Content-blocks is a list of alists in Anthropic API format (type text/tool_use).
                                (error "Undefined tool function: ~A" tool-symbol)))))
            (system-instruction (extract-system-instruction messages))
            (contents (convert-messages-to-gemini messages))
-           (headers `(("Content-Type" . "application/json"))))
+           (headers `(("Content-Type" . "application/json")
+                      ("x-goog-api-key" . ,api-key))))
 
       (if use-streaming
 
