@@ -543,7 +543,7 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                             ((stringp body) body)
                             (t nil))))
                     (when string-body
-                      ;; CLSEC-2026-0002: Redact query parameters from error URIs
+                      ;; CL-SEC-2026-0002: Redact query parameters from error URIs
                       ;; to prevent credential leakage in logs and error handlers.
                       (let* ((uri (princ-to-string (dex:request-uri e)))
                              (qpos (position #\? uri))
@@ -1116,7 +1116,7 @@ Content-blocks is a list of alists in Anthropic API format (type text/tool_use).
 
   (with-slots (api-key model tools) provider
 
-    ;; CLSEC-2026-0001: Move API key from URL query parameter to header.
+    ;; CL-SEC-2026-0001: Move API key from URL query parameter to header.
     ;; The key was previously appended to the URL, leaking it in logs,
     ;; error messages, and proxy access logs.
     (let* ((use-streaming (and streaming-callback (not tools)))
