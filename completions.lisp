@@ -25,6 +25,9 @@
 
 (in-package :completions)
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (pushnew '("false" . :false) json::+json-lisp-symbol-tokens+ :test 'equal))
+
 ;; Set this to an output stream to see debug logs.
 (defvar *debug-stream* nil)
 
@@ -566,22 +569,22 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                                                         (args (json:decode-json-from-string (rest (assoc :ARGUMENTS (rest (assoc :FUNCTION tool-call)))))))
                                                    `((:role . "tool")
                                                      (:tool_call_id . ,(rest (assoc :id tool-call)))
-                                                     (:content . ,(invoke-tool fn-name args))))))))
-            (completions-loop provider endpoint headers (append messages
-                                                                (loop for tool-call in tool-calls
-                                                                      collect `(("role" . "assistant")
-                                                                                ("content" . nil)
-                                                                                ("tool_calls" . ,(list tool-call))))
-                                                                tool-answers)
-                              payload-format-string streaming-callback))
-          (let ((response (with-output-to-string (s)
-                            (loop for obj in objs
-                                  do (when-let ((content (rest (assoc :content (second (assoc :delta (assoc :choices obj)))))))
-                                       (princ content s))))))
-            (values response
-                    (append1 messages
-                             `(("role" . "assistant")
-                               ("content" . ,response))))))
+                                                     (:content . ,(invoke-tool fn-name args)))))))
+                (completions-loop provider endpoint headers (append messages
+                                                                    (loop for tool-call in tool-calls
+                                                                          collect `(("role" . "assistant")
+                                                                                    ("content" . nil)
+                                                                                    ("tool_calls" . ,(list tool-call))))
+                                                                    tool-answers)
+                                  payload-format-string streaming-callback))
+              (let ((response (with-output-to-string (s)
+                                (loop for obj in objs
+                                      do (when-let ((content (rest (assoc :content (second (assoc :delta (assoc :choices obj)))))))
+                                           (princ content s))))))
+                (values response
+                        (append1 messages
+                                 `(("role" . "assistant")
+                                   ("content" . ,response)))))))
 
   ;; Non-streaming...
   (let ((objs (json:decode-json-from-string

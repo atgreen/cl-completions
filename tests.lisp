@@ -310,3 +310,10 @@
              (is (string= "image/png" (cdr (assoc "media_type" source :test #'string=))))
              (is (stringp (cdr (assoc :data source))))))
       (delete-file path))))
+
+;;; ---- JSON encoding tests ----
+
+(test false-encoding
+      "Test that :false is encoded as the JSON boolean false, not the string \"false\"."
+      (let ((encoded (json:encode-json-to-string '((:stream . :false)))))
+        (is (string= "{\"stream\":false}" encoded))))
