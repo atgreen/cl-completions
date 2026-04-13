@@ -48,4 +48,9 @@
            ;; Enhanced parameter validation
            validate-tool-parameters
            ;; Tool categories
-           *tool-categories*))
+           *tool-categories*
+           ;; Budget limits
+           *max-turns* *max-cost-usd* *cost-fn*
+           *turns-used* *cost-used*
+           budget-exceeded budget-exceeded-reason budget-exceeded-message
+           with-budget with-budget-guard))
