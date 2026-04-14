@@ -70,6 +70,89 @@ If it returns nil, normal tool execution proceeds.")
 (defvar *tool-error-hooks* nil
   "List of functions to call when a tool encounters an error")
 
+;; Budget limits
+(defvar *max-turns* nil
+  "Maximum number of LLM HTTP calls allowed per get-completion invocation. NIL means unlimited.")
+
+(defvar *max-cost-usd* nil
+  "Maximum accumulated cost in USD per get-completion invocation. NIL means unlimited.")
+
+(defvar *cost-fn* nil
+  "Function (tokens-in tokens-out) -> cost-usd for computing cost per call. NIL means no cost tracking.")
+
+(defvar *turns-used* 0
+  "Number of LLM HTTP calls made in the current get-completion invocation.
+Dynamically rebound to 0 at the start of each get-completion call.")
+
+(defvar *cost-used* 0.0d0
+  "Accumulated cost in USD for the current get-completion invocation.
+Dynamically rebound to 0.0d0 at the start of each get-completion call.")
+
+(define-condition budget-exceeded (error)
+  ((reason  :initarg :reason  :reader budget-exceeded-reason)
+   (message :initarg :message :reader budget-exceeded-message))
+  (:report (lambda (c s) (write-string (budget-exceeded-message c) s))))
+
+(defun check-budget ()
+  "Pre-call budget check: increment *turns-used* and verify both limits before an HTTP call.
+Cost is checked against the pre-call accumulated *cost-used* (not the upcoming call's cost)."
+  (incf *turns-used*)
+  (when (and *max-turns* (> *turns-used* *max-turns*))
+    (restart-case
+        (error 'budget-exceeded
+               :reason :max-turns
+               :message (format nil "Exceeded max-turns limit of ~A LLM round-trips (used: ~A)."
+                                *max-turns* *turns-used*))
+      (disable-turns-limit ()
+        :report "Disable the turns limit for the remainder of this run."
+        (setf *max-turns* nil))
+      (increase-turns-limit (&optional (n *max-turns*))
+        :report "Increase the turns limit (default: double it) for the remainder of this run."
+        (setf *max-turns* (+ *max-turns* n)))))
+  ;; Pre-call cost check: refuse to make the call if already over budget
+  (when (and *cost-fn* *max-cost-usd* (> *cost-used* *max-cost-usd*))
+    (restart-case
+        (error 'budget-exceeded
+               :reason :max-cost
+               :message (format nil "Exceeded max-cost-usd limit of $~,4F (accumulated: $~,4F)."
+                                *max-cost-usd* *cost-used*))
+      (disable-cost-limit ()
+        :report "Disable the cost limit for the remainder of this run."
+        (setf *max-cost-usd* nil))
+      (increase-cost-limit (&optional (amount *max-cost-usd*))
+        :report "Increase the cost limit (default: double it) for the remainder of this run."
+        (setf *max-cost-usd* (+ *max-cost-usd* amount))))))
+
+(defmacro with-budget (() &body body)
+  "Establish a fresh budget scope: rebind *max-turns* and *max-cost-usd* locally (so restarts
+only affect this invocation) and reset the counters *turns-used* and *cost-used* to zero."
+  `(let ((*max-turns*    *max-turns*)
+         (*max-cost-usd* *max-cost-usd*)
+         (*turns-used*   0)
+         (*cost-used*    0.0d0))
+     ,@body))
+
+(defmacro with-budget-guard ((provider) &body body)
+  "Wrap a single LLM HTTP call with budget enforcement.
+Before BODY: calls check-budget (increments turn counter, checks both limits pre-call).
+BODY should include the HTTP call and any immediate token-count update on PROVIDER.
+After BODY: computes the token delta on PROVIDER and updates *cost-used* via *cost-fn*."
+  (let ((tokens-in-before  (gensym "TOKENS-IN-"))
+        (tokens-out-before (gensym "TOKENS-OUT-")))
+    `(let ((,tokens-in-before  (prompt-token-count ,provider))
+           (,tokens-out-before (completion-token-count ,provider)))
+       (check-budget)
+       
+       (multiple-value-prog1
+           (progn ,@body)
+         
+         (when *cost-fn*
+           (let ((delta-in  (- (prompt-token-count ,provider) ,tokens-in-before))
+                 (delta-out (- (completion-token-count ,provider) ,tokens-out-before)))
+             (when (or (plusp delta-in) (plusp delta-out))
+               (incf *cost-used*
+                     (funcall *cost-fn* delta-in delta-out)))))))))
+
 (defclass completer ()
   ()
   (:documentation "Base class for completion providers."))
@@ -554,144 +637,150 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                                string-body))))))))
     (apply #'dex:post args)))
 
-(defun completions-loop (provider endpoint headers messages payload-format-string streaming-callback)
+(defun openai-completions-loop (provider endpoint headers messages payload-format-string streaming-callback)
   "Main loop for handling completions, including streaming and tool call execution."
-  (let ((payload (format nil payload-format-string (json:encode-json-to-string messages)))
-        (objs))
+  (let ((payload (format nil payload-format-string (json:encode-json-to-string messages))))
     (if streaming-callback
-        (let* ((response-stream (safe-http-request endpoint
-                                          :read-timeout *read-timeout*
-                                          :content payload
-                                          :headers headers
-                                          :want-stream t)))
-          (unwind-protect
-               (setf objs (read-streamed-json-objects response-stream streaming-callback))
-            (close response-stream))
-          (if-let ((has-tool-calls (detect-tool-calls-in-stream objs)))
-              (let* ((tool-calls (accumulate-tool-calls objs))
-                     (tool-answers (loop for tool-call in tool-calls
-                                         collect (let* ((fn-name (rest (assoc :NAME (rest (assoc :FUNCTION tool-call)))))
-                                                        (args (json:decode-json-from-string (rest (assoc :ARGUMENTS (rest (assoc :FUNCTION tool-call)))))))
-                                                   `((:role . "tool")
-                                                     (:tool_call_id . ,(rest (assoc :id tool-call)))
-                                                     (:content . ,(invoke-tool fn-name args)))))))
-                (completions-loop provider endpoint headers (append messages
-                                                                    (loop for tool-call in tool-calls
-                                                                          collect `(("role" . "assistant")
-                                                                                    ("content" . nil)
-                                                                                    ("tool_calls" . ,(list tool-call))))
-                                                                    tool-answers)
-                                  payload-format-string streaming-callback))
-              (let ((response (with-output-to-string (s)
-                                (loop for obj in objs
-                                      do (when-let ((content (rest (assoc :content (second (assoc :delta (assoc :choices obj)))))))
-                                           (princ content s))))))
-                (values response
-                        (append1 messages
-                                 `(("role" . "assistant")
-                                   ("content" . ,response)))))))
+      (let* ((objs (with-budget-guard (provider)
+                     (let* ((response-stream (safe-http-request endpoint
+                                                                :read-timeout *read-timeout*
+                                                                :content payload
+                                                                :headers headers
+                                                                :want-stream t)))
+                       (unwind-protect
+                            (read-streamed-json-objects response-stream streaming-callback)
+                         (close response-stream))))))
+        (if-let ((has-tool-calls (detect-tool-calls-in-stream objs)))
+          (let* ((tool-calls (accumulate-tool-calls objs))
+                 (tool-answers (loop for tool-call in tool-calls
+                                     collect (let* ((fn-name (rest (assoc :NAME (rest (assoc :FUNCTION tool-call)))))
+                                                    (args (json:decode-json-from-string (rest (assoc :ARGUMENTS (rest (assoc :FUNCTION tool-call)))))))
+                                               `((:role . "tool")
+                                                 (:tool_call_id . ,(rest (assoc :id tool-call)))
+                                                 (:content . ,(invoke-tool fn-name args)))))))
+            (openai-completions-loop provider endpoint headers
+                                     (append messages
+                                             (loop for tool-call in tool-calls
+                                                   collect `(("role" . "assistant")
+                                                             ("content" . nil)
+                                                             ("tool_calls" . ,(list tool-call))))
+                                             tool-answers)
+                                     payload-format-string
+                                     streaming-callback))
+          (let ((response (with-output-to-string (s)
+                            (loop for obj in objs
+                                  do (when-let ((content (rest (assoc :content (second (assoc :delta (assoc :choices obj)))))))
+                                       (princ content s))))))
+            (values response
+                    (append1 messages
+                             `(("role" . "assistant")
+                               ("content" . ,response)))))))
 
-  ;; Non-streaming...
-  (let ((objs (json:decode-json-from-string
-         (convert-byte-array-to-utf8
-                      (let ((ba (safe-http-request endpoint
-            :read-timeout *read-timeout*
-            :content payload
-            :headers headers
-            :force-binary t
-            :want-stream nil)))
-      (when *debug-stream* (print ba))
-      ba)))))
-    (when *debug-stream*
-      (format *debug-stream* "~&api call result: ~A~%" objs))
-    ;; Parse usage from OpenAI response
-    (when-let ((usage (rest (assoc :usage objs))))
-      (when (typep provider 'openai-completer)
-        (setf (prompt-token-count provider)
-              (or (rest (assoc :prompt--tokens usage)) 0))
-        (setf (completion-token-count provider)
-              (or (rest (assoc :completion--tokens usage)) 0))))
-    (if-let ((tool-calls (rest (assoc :tool--calls (rest (assoc :message (second (assoc :choices objs))))))))
-              (let ((tool-answers (loop for tool-call in tool-calls
-          collect (let* ((args (json:decode-json-from-string (rest (assoc :ARGUMENTS (rest (assoc :FUNCTION tool-call))))))
-                   (fn-name (rest (assoc :NAME (rest (assoc :FUNCTION tool-call))))))
-              `((:role . "tool")
-                (:tool_call_id . ,(rest (assoc :id tool-call)))
-                (:content . ,(invoke-tool fn-name args)))))))
-    (completions-loop provider endpoint headers (append messages
-                    (loop for tool-call in tool-calls
-                    collect `(("role" . "assistant")
-                        ("content" . nil)
-                        ("tool_calls" . ,(list tool-call))))
-                    tool-answers)
-          payload-format-string nil))
-      (let ((response (rest (assoc :content (rest (assoc :message (second (assoc :choices objs))))))))
-        (values response
-                (append1 messages
-                         `(("role" . "assistant")
-                           ("content" . ,response))))))))))
+      ;; Non-streaming...
+      (let ((objs (with-budget-guard (provider)
+                    (let* ((ba (safe-http-request endpoint
+                                                  :read-timeout *read-timeout*
+                                                  :content payload
+                                                  :headers headers
+                                                  :force-binary t
+                                                  :want-stream nil))
+                           (result (json:decode-json-from-string
+                                    (convert-byte-array-to-utf8
+                                     (progn (when *debug-stream* (print ba)) ba)))))
+                      (when *debug-stream*
+                        (format *debug-stream* "~&api call result: ~A~%" result))
+                      (when-let ((usage (rest (assoc :usage result))))
+                        (when (typep provider 'openai-completer)
+                          (setf (prompt-token-count provider)
+                                (or (rest (assoc :prompt--tokens usage)) 0))
+                          (setf (completion-token-count provider)
+                                (or (rest (assoc :completion--tokens usage)) 0))))
+                      result))))
+        (if-let ((tool-calls (rest (assoc :tool--calls (rest (assoc :message (second (assoc :choices objs))))))))
+          (let ((tool-answers (loop for tool-call in tool-calls
+                                    collect (let* ((args (json:decode-json-from-string (rest (assoc :ARGUMENTS (rest (assoc :FUNCTION tool-call))))))
+                                                   (fn-name (rest (assoc :NAME (rest (assoc :FUNCTION tool-call))))))
+                                              `((:role . "tool")
+                                                (:tool_call_id . ,(rest (assoc :id tool-call)))
+                                                (:content . ,(invoke-tool fn-name args)))))))
+            (openai-completions-loop provider endpoint headers
+                                     (append messages
+                                             (loop for tool-call in tool-calls
+                                                   collect `(("role" . "assistant")
+                                                             ("content" . nil)
+                                                             ("tool_calls" . ,(list tool-call))))
+                                             tool-answers)
+                                     payload-format-string nil))
+          (let ((response (rest (assoc :content (rest (assoc :message (second (assoc :choices objs))))))))
+            (values response
+                    (append1 messages
+                             `(("role" . "assistant")
+                               ("content" . ,response))))))))))
 
 (defmethod get-completion ((provider openai-completer) messages &key (max-tokens 1024) (streaming-callback nil) (response-format nil))
   (when (stringp messages)
     (setf messages `(((:role . "user") (:content . ,messages)))))
-  (with-slots (endpoint api-key model completion-token-count prompt-token-count tools) provider
-    (let* ((tools-rendered
-             (json:encode-json-to-string (loop for tool-symbol in tools
-                                               collect (if-let ((tool (gethash (symbol-name tool-symbol) *tools*)))
-                                                         (render tool)
-                                                         (error "Undefined tool function: ~A" tool-symbol)))))
-           (payload-format-string
-             (format nil "{ \"model\": ~S, \"stream\": ~A, ~A ~A \"messages\": ~~A, \"max_tokens\": ~A }"
-                     model
-                     (if streaming-callback "true" "false")
-                     (if tools (format nil "\"tools\": ~A," tools-rendered) "")
-                     (if response-format (format nil "\"response_format\": { \"type\": ~S }," response-format) "")
-                     max-tokens))
-           (headers `(("Content-Type" . "application/json")
-                      ("Authorization" . ,(concatenate 'string "Bearer " api-key)))))
-      (completions-loop provider endpoint headers messages payload-format-string streaming-callback))))
+  (with-budget ()
+    (with-slots (endpoint api-key model completion-token-count prompt-token-count tools) provider
+      (let* ((tools-rendered
+               (json:encode-json-to-string (loop for tool-symbol in tools
+                                                 collect (if-let ((tool (gethash (symbol-name tool-symbol) *tools*)))
+                                                           (render tool)
+                                                           (error "Undefined tool function: ~A" tool-symbol)))))
+             (payload-format-string
+               (format nil "{ \"model\": ~S, \"stream\": ~A, ~A ~A \"messages\": ~~A, \"max_tokens\": ~A }"
+                       model
+                       (if streaming-callback "true" "false")
+                       (if tools (format nil "\"tools\": ~A," tools-rendered) "")
+                       (if response-format (format nil "\"response_format\": { \"type\": ~S }," response-format) "")
+                       max-tokens))
+             (headers `(("Content-Type" . "application/json")
+                        ("Authorization" . ,(concatenate 'string "Bearer " api-key)))))
+        (openai-completions-loop provider endpoint headers messages payload-format-string streaming-callback)))))
 
 
 (defmethod get-completion ((provider ollama-completer) messages &key (max-tokens 1024) (streaming-callback nil) (response-format nil))
   (when (stringp messages)
     (setf messages `(((:role . "user") (:content . ,messages)))))
 
-  (with-slots (endpoint model tools) provider
+  (with-budget ()
+    (with-slots (endpoint model tools) provider
 
-    (when (and streaming-callback tools)
-      (error "streaming-callback and tools cannot be used together with ollama completer"))
-    (let* ((tools-rendered
-             (when tools
-               (loop for tool-symbol in tools
-                     collect (if-let ((tool (gethash (symbol-name tool-symbol) *tools*)))
-                               (render tool)
-                               (error "Undefined tool function: ~A" tool-symbol)))))
-           (headers `(("Content-Type" . "application/json"))))
+      (when (and streaming-callback tools)
+        (error "streaming-callback and tools cannot be used together with ollama completer"))
+      (let* ((tools-rendered
+               (when tools
+                 (loop for tool-symbol in tools
+                       collect (if-let ((tool (gethash (symbol-name tool-symbol) *tools*)))
+                                 (render tool)
+                                 (error "Undefined tool function: ~A" tool-symbol)))))
+             (headers `(("Content-Type" . "application/json"))))
 
-      (if streaming-callback
+        (if streaming-callback
 
-          ;; Streaming (no tools)
-          (let* ((content
-                   (json:encode-json-to-string
-                     `((:model . ,model) (:stream . t)
-                       ,@(when response-format `((:format . ,response-format)))
-                       (:options . ((:num_predict . ,max-tokens)))
-                       (:messages . ,(make-array (length messages) :initial-contents messages)))))
-                 (response-stream (safe-http-request endpoint
-                                            :read-timeout *read-timeout*
-                                            :content content
-                                            :headers headers
-                                            :want-stream t)))
+            ;; Streaming (no tools)
+            (let* ((content
+                     (json:encode-json-to-string
+                       `((:model . ,model) (:stream . t)
+                         ,@(when response-format `((:format . ,response-format)))
+                         (:options . ((:num_predict . ,max-tokens)))
+                         (:messages . ,(make-array (length messages) :initial-contents messages))))))
             (let ((response
-                    (unwind-protect
-                         (with-output-to-string (sstream)
-                           (loop
-                             for json-object = (ignore-errors (json:decode-json-from-string (read-line response-stream)))
-                             until (or (null json-object) (rest (assoc :done json-object)))
-                             do (progn
-                                  (format sstream "~A" (rest (assoc :CONTENT (rest (assoc :MESSAGE json-object)))))
-                                  (funcall streaming-callback (rest (assoc :CONTENT (rest (assoc :MESSAGE json-object))))))))
-                      (close response-stream))))
+                    (with-budget-guard (provider)
+                      (let* ((response-stream (safe-http-request endpoint
+                                                                 :read-timeout *read-timeout*
+                                                                 :content content
+                                                                 :headers headers
+                                                                 :want-stream t)))
+                        (unwind-protect
+                             (with-output-to-string (sstream)
+                               (loop
+                                 for json-object = (ignore-errors (json:decode-json-from-string (read-line response-stream)))
+                                 until (or (null json-object) (rest (assoc :done json-object)))
+                                 do (progn
+                                      (format sstream "~A" (rest (assoc :CONTENT (rest (assoc :MESSAGE json-object)))))
+                                      (funcall streaming-callback (rest (assoc :CONTENT (rest (assoc :MESSAGE json-object))))))))
+                          (close response-stream))))))
               (values response
                       (append1 messages `((:ROLE . "assistant") (:CONTENT . ,response))))))
 
@@ -709,11 +798,12 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                                                           :initial-contents api-messages))))
               for _o1 = (when *debug-stream*
                           (format *debug-stream* "~&ollama request: ~A~%" content))
-              for response = (json:decode-json-from-string
-                               (safe-http-request endpoint
-                                         :read-timeout *read-timeout*
-                                         :content content
-                                         :headers headers))
+              for response = (with-budget-guard (provider)
+                               (json:decode-json-from-string
+                                (safe-http-request endpoint
+                                          :read-timeout *read-timeout*
+                                          :content content
+                                          :headers headers)))
               for _o2 = (when *debug-stream*
                           (format *debug-stream* "~&ollama response: ~A~%" response))
               for message = (rest (assoc :message response))
@@ -737,7 +827,7 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                 (let ((text (rest (assoc :content message))))
                   (return (values text
                                   (append1 messages
-                                           `((:role . "assistant") (:content . ,text))))))))))))
+                                           `((:role . "assistant") (:content . ,text)))))))))))))
 
 (defun read-anthropic-sse-stream (stream streaming-callback)
   "Read Anthropic SSE events from STREAM, call STREAMING-CALLBACK for text deltas.
@@ -839,7 +929,8 @@ Content-blocks is a list of alists in Anthropic API format (type text/tool_use).
   (when (stringp messages)
     (setf messages `(((:role . "user") (:content . ,messages)))))
 
-  (with-slots (endpoint api-key model tools) provider
+  (with-budget ()
+    (with-slots (endpoint api-key model tools) provider
 
     (let* ((system-text
              (with-output-to-string (s)
@@ -896,18 +987,20 @@ Content-blocks is a list of alists in Anthropic API format (type text/tool_use).
             for json-content = (json:encode-json-to-string payload)
             for _s1 = (when *debug-stream*
                         (format *debug-stream* "~&anthropic streaming request: ~A~%" json-content))
-            for response-stream = (safe-http-request endpoint
-                                            :read-timeout *read-timeout*
-                                            :content json-content
-                                            :headers headers
-                                            :want-stream t)
             for (text in-tokens out-tokens content-blocks stop-reason) =
-                (unwind-protect
-                     (multiple-value-list
-                      (read-anthropic-sse-stream response-stream streaming-callback))
-                  (close response-stream))
-            for _s2 = (progn (setf (prompt-token-count provider) in-tokens)
-                             (setf (completion-token-count provider) out-tokens))
+                (with-budget-guard (provider)
+                  (let* ((response-stream (safe-http-request endpoint
+                                                    :read-timeout *read-timeout*
+                                                    :content json-content
+                                                    :headers headers
+                                                    :want-stream t)))
+                    (multiple-value-bind (txt in-tok out-tok blocks stop)
+                        (unwind-protect
+                             (read-anthropic-sse-stream response-stream streaming-callback)
+                          (close response-stream))
+                      (setf (prompt-token-count provider) in-tok)
+                      (setf (completion-token-count provider) out-tok)
+                      (list txt in-tok out-tok blocks stop))))
             for tool-use-blocks = (when content-blocks
                                     (remove-if-not
                                      (lambda (b) (string= (rest (assoc :type b)) "tool_use"))
@@ -953,21 +1046,23 @@ Content-blocks is a list of alists in Anthropic API format (type text/tool_use).
             for content = (json:encode-json-to-string payload)
             for _a1 = (when *debug-stream*
                         (format *debug-stream* "~&anthropic request: ~A~%" content))
-            for response = (json:decode-json-from-string
-                             (convert-byte-array-to-utf8
-                               (safe-http-request endpoint
-                                         :read-timeout *read-timeout*
-                                         :content content
-                                         :headers headers
-                                         :force-binary t
-                                         :want-stream nil)))
-            for _a2 = (when *debug-stream*
-                        (format *debug-stream* "~&anthropic response: ~A~%" response))
-            for _a3 = (when-let ((usage (rest (assoc :usage response))))
-                        (setf (prompt-token-count provider)
-                              (or (rest (assoc :input--tokens usage)) 0))
-                        (setf (completion-token-count provider)
-                              (or (rest (assoc :output--tokens usage)) 0)))
+            for response = (with-budget-guard (provider)
+                             (let ((r (json:decode-json-from-string
+                                       (convert-byte-array-to-utf8
+                                        (safe-http-request endpoint
+                                                           :read-timeout *read-timeout*
+                                                           :content content
+                                                           :headers headers
+                                                           :force-binary t
+                                                           :want-stream nil)))))
+                               (when *debug-stream*
+                                 (format *debug-stream* "~&anthropic response: ~A~%" r))
+                               (when-let ((usage (rest (assoc :usage r))))
+                                 (setf (prompt-token-count provider)
+                                       (or (rest (assoc :input--tokens usage)) 0))
+                                 (setf (completion-token-count provider)
+                                       (or (rest (assoc :output--tokens usage)) 0)))
+                               r))
             for content-blocks = (mapcar
                                    (lambda (block)
                                      (if (and (string= (rest (assoc :type block)) "tool_use")
@@ -1003,7 +1098,7 @@ Content-blocks is a list of alists in Anthropic API format (type text/tool_use).
                                              :test #'string=)))))
                 (return (values text
                                 (append1 messages
-                                         `((:role . "assistant") (:content . ,text)))))))))))
+                                         `((:role . "assistant") (:content . ,text))))))))))))
 
 (defmethod render-gemini ((tool function-tool))
   "Render a function-tool as a Gemini functionDeclaration."
@@ -1114,75 +1209,81 @@ Content-blocks is a list of alists in Anthropic API format (type text/tool_use).
   (when (stringp messages)
     (setf messages `(((:role . "user") (:content . ,messages)))))
 
-  (with-slots (api-key model tools) provider
+  (with-budget ()
+    (with-slots (api-key model tools) provider
 
-    ;; CL-SEC-2026-0001: Move API key from URL query parameter to header.
-    ;; The key was previously appended to the URL, leaking it in logs,
-    ;; error messages, and proxy access logs.
-    (let* ((use-streaming (and streaming-callback (not tools)))
-           (endpoint (format nil "https://generativelanguage.googleapis.com/v1beta/models/~A:~A"
-                             model
-                             (if use-streaming "streamGenerateContent?alt=sse" "generateContent")))
-           (tools-rendered
-             (when tools
-               (loop for tool-symbol in tools
-                     collect (if-let ((tool (gethash (symbol-name tool-symbol) *tools*)))
-                               (render-gemini tool)
-                               (error "Undefined tool function: ~A" tool-symbol)))))
-           (system-instruction (extract-system-instruction messages))
-           (contents (convert-messages-to-gemini messages))
-           (headers `(("Content-Type" . "application/json")
-                      ("x-goog-api-key" . ,api-key))))
+      ;; CL-SEC-2026-0001: Move API key from URL query parameter to header.
+      ;; The key was previously appended to the URL, leaking it in logs,
+      ;; error messages, and proxy access logs.
+      (let* ((use-streaming (and streaming-callback (not tools)))
+             (endpoint (format nil "https://generativelanguage.googleapis.com/v1beta/models/~A:~A"
+                               model
+                               (if use-streaming "streamGenerateContent?alt=sse" "generateContent")))
+             (tools-rendered
+               (when tools
+                 (loop for tool-symbol in tools
+                       collect (if-let ((tool (gethash (symbol-name tool-symbol) *tools*)))
+                                 (render-gemini tool)
+                                 (error "Undefined tool function: ~A" tool-symbol)))))
+             (system-instruction (extract-system-instruction messages))
+             (contents (convert-messages-to-gemini messages))
+             (headers `(("Content-Type" . "application/json")
+                        ("x-goog-api-key" . ,api-key))))
 
-      (if use-streaming
+        (if use-streaming
 
           ;; Streaming path (no tools)
           (let* ((payload (gemini-make-payload contents nil max-tokens system-instruction response-format))
                  (content (json:encode-json-to-string payload)))
             (when *debug-stream*
               (format *debug-stream* "~&gemini streaming request: ~A~%" content))
-            (let ((response-stream (safe-http-request endpoint
-                                              :read-timeout *read-timeout*
-                                              :content content
-                                              :headers headers
-                                              :want-stream t)))
-              (unwind-protect
-                   (let ((text (read-gemini-sse-stream response-stream streaming-callback)))
-                     (values text
-                             (append1 messages
-                                      `((:role . "assistant") (:content . ,text)))))
-                (close response-stream))))
+            (with-budget-guard (provider)
+              (let ((response-stream (safe-http-request endpoint
+                                                        :read-timeout *read-timeout*
+                                                        :content content
+                                                        :headers headers
+                                                        :want-stream t)))
+                (unwind-protect
+                     (let ((text (read-gemini-sse-stream response-stream streaming-callback)))
+                       (values text
+                               (append1 messages
+                                        `((:role . "assistant") (:content . ,text)))))
+                  (close response-stream)))))
 
           ;; Non-streaming tool-calling loop
           (loop
-        for payload = (gemini-make-payload contents tools-rendered max-tokens system-instruction response-format)
-        for response = (gemini-call endpoint payload headers)
-        for _g1 = (when-let ((usage (rest (assoc :usage-metadata response))))
-                    (setf (prompt-token-count provider)
-                          (or (rest (assoc :prompt-token-count usage)) 0))
-                    (setf (completion-token-count provider)
-                          (or (rest (assoc :candidates-token-count usage)) 0)))
-        for candidate = (first (rest (assoc :candidates response)))
-        for parts = (rest (assoc :parts (rest (assoc :content candidate))))
-        for fn-calls = (loop for part in parts
-                             when (assoc :function-call part)
-                             collect (rest (assoc :function-call part)))
-        while fn-calls
-        do (let ((tool-results
-                   (loop for fn-call in fn-calls
-                         for fn-name = (rest (assoc :name fn-call))
-                         for fn-args = (rest (assoc :args fn-call))
-                         for tool-key = (string-upcase fn-name)
-                         collect `((:function-response
-                                    . ((:name . ,fn-name)
-                                       (:response . ((:content . ,(invoke-tool tool-key fn-args))))))))))
-             (setf contents (append contents
-                                    (list `((:role . "model") (:parts . ,parts)))
-                                    (list `((:role . "user") (:parts . ,tool-results))))))
-        finally
-          (let ((text (rest (assoc :text (first parts)))))
-            (when (and streaming-callback text)
-              (funcall streaming-callback text))
-            (return (values text
-                            (append1 messages
-                                     `((:role . "assistant") (:content . ,text)))))))))))
+            for response = (with-budget-guard (provider)
+                             (let ((r (gemini-call endpoint
+                                                   (gemini-make-payload contents tools-rendered max-tokens
+                                                                        system-instruction response-format)
+                                                   headers)))
+                               (when-let ((usage (rest (assoc :usage-metadata r))))
+                                 (setf (prompt-token-count provider)
+                                       (or (rest (assoc :prompt-token-count usage)) 0))
+                                 (setf (completion-token-count provider)
+                                       (or (rest (assoc :candidates-token-count usage)) 0)))
+                               r))
+            for candidate = (first (rest (assoc :candidates response)))
+            for parts = (rest (assoc :parts (rest (assoc :content candidate))))
+            for fn-calls = (loop for part in parts
+                                 when (assoc :function-call part)
+                                   collect (rest (assoc :function-call part)))
+            while fn-calls
+            do (let ((tool-results
+                       (loop for fn-call in fn-calls
+                             for fn-name = (rest (assoc :name fn-call))
+                             for fn-args = (rest (assoc :args fn-call))
+                             for tool-key = (string-upcase fn-name)
+                             collect `((:function-response
+                                        . ((:name . ,fn-name)
+                                           (:response . ((:content . ,(invoke-tool tool-key fn-args))))))))))
+                 (setf contents (append contents
+                                        (list `((:role . "model") (:parts . ,parts)))
+                                        (list `((:role . "user") (:parts . ,tool-results))))))
+            finally
+               (let ((text (rest (assoc :text (first parts)))))
+                 (when (and streaming-callback text)
+                   (funcall streaming-callback text))
+                 (return (values text
+                                 (append1 messages
+                                          `((:role . "assistant") (:content . ,text))))))))))))
