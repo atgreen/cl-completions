@@ -584,7 +584,7 @@ Unknown tools and tool errors return \"Error: ...\" strings so the LLM can recov
                                   payload-format-string streaming-callback))
               (let ((response (with-output-to-string (s)
                                 (loop for obj in objs
-                                      do (when-let ((content (rest (assoc :content (second (assoc :delta (assoc :choices obj)))))))
+                                      do (when-let ((content (rest (assoc :content (list (second (assoc :delta (second (assoc :choices obj)))))  ))))
                                            (princ content s))))))
                 (values response
                         (append1 messages
